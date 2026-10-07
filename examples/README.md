@@ -1,36 +1,19 @@
 # Examples
 
-Training examples organized by target model and scale.
+Training recipes for the Expected Decoding Rounds (EDR) paper experiments:
+second-stage finetuning of released drafters with the EDR objective and the
+E2E multi-step TV baseline. Each recipe runs on a single GPU (the paper used
+one NVIDIA H200; one B200 or RTX PRO 6000 also works) with a global batch of 96.
 
-## Single-Node (Qwen3-8B)
+| Example | Drafter | Target | Objective | Config |
+|---------|---------|--------|-----------|--------|
+| [qwen3-4b-dspark-edr](qwen3-4b-dspark-edr/) | DSpark | Qwen3-4B | EDR | `configs/vllm_qwen3_4b_dspark_edr.yaml` |
+| [qwen3-4b-dspark-e2e](qwen3-4b-dspark-e2e/) | DSpark | Qwen3-4B | E2E | `configs/vllm_qwen3_4b_dspark_e2e.yaml` |
+| [qwen3-8b-dfly-cpt-edr](qwen3-8b-dfly-cpt-edr/) | DFly Block8 | Qwen3-8B | EDR | `configs/vllm_qwen3_8b_dfly_edr.yaml` |
+| [qwen3-8b-dfly-cpt-e2e](qwen3-8b-dfly-cpt-e2e/) | DFly Block8 | Qwen3-8B | E2E | `configs/vllm_qwen3_8b_dfly_e2e.yaml` |
 
-These examples use [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) as the
-target model. All run on a single 8-GPU node.
-
-| Example | Architecture | Mode | Released Model |
-|---------|-------------|------|----------------|
-| [qwen3-8b-dspark](qwen3-8b-dspark/) | DSpark | From scratch | — |
-| [qwen3-8b-dfly](qwen3-8b-dfly/) | DFly | From scratch | AngelSlim/Qwen3-8B-DFly-B8 |
-| [qwen3-8b-mtp](qwen3-8b-mtp/) | MTP | From scratch | AngelSlim/Qwen3-8B-MTP-TTT3 |
-| [qwen3-8b-dfly-cpt](qwen3-8b-dfly-cpt/) | DFly | Continual training | — |
-
-**Start here:** `qwen3-8b-dfly` is the recommended first example if you have 8 GPUs.
-
-## Multi-Node (Hy3)
-
-These examples target Hy3 (large MoE) and require 2+ nodes with RDMA.
-The target model is not publicly available — use these as reference configurations
-for your own large target models.
-
-| Example | Architecture | Mode | Released Model |
-|---------|-------------|------|----------------|
-| [hy3-dfly](hy3-dfly/) | DFly | From scratch | AngelSlim/Hy3-DFly-B8 |
-| [hy3-mtp](hy3-mtp/) | MTP | From scratch | AngelSlim/Hy3-MTP-TTT3 |
-
-## Sample Data
-
-`data/sample_conversations.jsonl` contains a small dataset for testing.
-`data/eval_conversations.jsonl` contains evaluation prompts for online eval.
-
-For real training, prepare your data as described in
-[Data Preparation](../docs/basic_usage/data_preparation.md).
+Sample the training data first with [generate_training_data](generate_training_data/)
+from the same training config (so it uses exactly the config's
+`dataset.target_sampling`), then train. The 4B EDR
+README also covers the DSpark checkpoint import and hardware presets shared by
+both DSpark recipes. Offline MAL evaluation is in [eval](eval/).

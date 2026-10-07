@@ -24,8 +24,10 @@ class DFlyModel(DFlashModel):
     ) -> torch.Tensor:
         """Apply hidden-states correction (if present), then project to logits.
 
-        ``prev_token_ids`` is ``[B, n_blocks, block_size]`` — the ground-truth
-        token preceding each draft slot's target (aligned with ``draft_hidden``).
+        ``prev_token_ids`` is ``[B, n_blocks, projection_width]`` — the
+        ground-truth token preceding each projected slot's target (aligned with
+        ``draft_hidden``). With ``query_includes_input_anchor``, the input-anchor
+        query slot is removed before this hook.
         """
         # Correction (TreeFlash formula (1)) BEFORE the LM head, conditioning the
         # token distribution on the previous token.
@@ -35,6 +37,22 @@ class DFlyModel(DFlashModel):
             prev_embeds = prev_embeds.view(bsz, -1, prev_embeds.size(-1))
             draft_hidden = self.draft_model.hidden_correction(draft_hidden, prev_embeds)
 
+        if hasattr(self.draft_model, "lm_head"):
+            return self.draft_model.lm_head(draft_hidden)
+        return F.linear(draft_hidden, lm_head_weight)
+
+    def _compute_step_logits(
+        self,
+        draft_hidden: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        previous_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the DFly correction to one sampled proposal position."""
+
+        correction = getattr(self.draft_model, "hidden_correction", None)
+        if correction is not None:
+            previous_embeddings = self.draft_model.embed_tokens(previous_token_ids)
+            draft_hidden = correction(draft_hidden, previous_embeddings)
         if hasattr(self.draft_model, "lm_head"):
             return self.draft_model.lm_head(draft_hidden)
         return F.linear(draft_hidden, lm_head_weight)

@@ -1,0 +1,111 @@
+# Qwen3-4B DSpark, five epochs. EDR and E2E use the same target responses,
+# initialization and 96-row global batch.
+# Single GPU (paper: one H200). run.sh keeps these H200 execution sizes and
+# adjusts only grouping/temporary sizes for B200, RTX PRO 6000 or <128 GiB SM90.
+model:
+  target_model_path: ./target_models/Qwen3-4B
+  target_model_backend: hf
+  trust_remote_code: true
+  draft_model_config: angelspec/config/dspark_qwen3_4b_draft_config.json
+  lm_head_key: lm_head.weight
+
+dataset:
+  epoch_cache_dirs: ["${cache_dir}/epoch1", "${cache_dir}/epoch2", "${cache_dir}/epoch3", "${cache_dir}/epoch4", "${cache_dir}/epoch5"]
+  train_data_path: ../dataset/Open-PerfectBlend/open-perfectblend.jsonl
+  eval_data_path: null
+  chat_template: qwen
+  allow_full_length_cached_sequences: true
+  prompt_key: conversations
+  min_loss_tokens: 32
+  shuffle_dataset: true
+  num_proc: 24
+  # Both losses consume this same target-generated cache, never OPB answers.
+  target_sampling:
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    min_p: 0.0
+    enable_thinking: false
+
+training:
+  # run.sh sets DRAFT_CKPT for initialization, or resumes from its output directory.
+  load_path: null
+  continual_training: true
+  override_lr_scheduler: true  # On resume, apply this LR schedule at the restored step; Adam state is kept.
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 96  # One GPU x 96 = 96 source rows/step.
+  length_balance_optimizer_step: true
+  learning_rate: 3e-5
+  min_lr: 3e-6
+  lr_decay_style: constant  # Linear warmup, then no decay.
+  warmup_ratio: 0.04  # Applied once to epoch 1's optimizer-step count.
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  max_concurrent_batches: 1
+  max_seq_length: 4096
+  num_epochs: 5
+  num_train_steps: null
+  seed: 42
+  ttt_length: 7
+  fsdp_strategy: REPLICATE
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 0
+  training_num_nodes: 1
+  training_num_gpus_per_node: 1
+  save_interval: 1000
+  save_per_epoch: true
+  max_checkpoints: 60
+  distributed_timeout_minutes: 30
+
+  # Seven learned proposals; DSpark has no DFly input-only query slot.
+  dflash_block_size: 7
+  dflash_query_includes_input_anchor: false
+  dflash_num_target_layers: 5
+  dspark_num_target_layers: 5
+  dflash_num_anchors: 512
+  dspark_num_anchors: 512
+  dflash_fp32_lm_head: false
+  # Pure objective comparison: no CE, hidden-state L1, or confidence-head loss.
+  dflash_ce_loss_alpha: 0.0
+  dflash_l1_loss_alpha: 0.0
+  dflash_kl_loss_weight: 0.0
+  dflash_gate_entropy_weight: 0.0
+  dspark_ce_loss_alpha: 0.0
+  dspark_l1_loss_alpha: 0.0
+  dspark_confidence_head_alpha: 0.0
+  dflash_loss_decay_gamma: 0.0
+  dspark_loss_decay_gamma: 0.0
+  dflash_packing: false
+  dflash_packing_token_weighted_loss: false
+  dflash_loss_objective: edr
+  # Target distribution after temperature/top-k/top-p; the draft uses the same
+  # temperature over its full vocabulary. min-p is disabled.
+  dflash_edr_temperature: ${dataset.target_sampling.temperature}
+  dflash_edr_top_k: ${dataset.target_sampling.top_k}
+  dflash_edr_top_p: ${dataset.target_sampling.top_p}
+  dflash_edr_chunk_size: 2048
+  dflash_edr_vocab_chunk_size: 65536
+  dflash_edr_cross_row_batch_size: 4
+  dflash_edr_dp_workers: 8
+  dflash_edr_reuse_context_cache: true
+  dflash_edr_rejection_cache_max_mb: 0
+  # Coalesce equal-width target prefills; the optimizer batch stays 96 rows.
+  single_gpu_target_batch_size: 8
+  single_gpu_target_max_tokens: 32768
+  dflash_lk_loss_weight: 0.0
+  dflash_e2e_tv_loss_weight: 0.0
+
+inference:
+  # Single-GPU HF target features are pre-final-norm last hidden states, the
+  # same contract as the vLLM feature cache. No inference engine is started.
+  store_last_hidden_states: true
+  last_hidden_states_prenorm: true
+
+output_dir: ./outputs/qwen3-4b-dspark-edr
+# The name encodes target and sampling; the .pt.json sidecar is also checked
+# against the target identity and sampling parameters before loading.
+cache_dir: ./dataset/Open-PerfectBlend/cache/Qwen3-4B__nonthink__T0.7__topP0.8__topK20__minP0
+model_download_dir: null
+logging:
+  report_to: none

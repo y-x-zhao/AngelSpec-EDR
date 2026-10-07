@@ -4,8 +4,9 @@
 
 - Linux, CUDA 12.4+
 - Python 3.11+
-- One or more NVIDIA GPUs. The [quickstart](quickstart.md) needs 8 GPUs
-  (4 inference + 4 training); multi-node examples need RDMA-capable interconnect for Mooncake.
+- One or more NVIDIA GPUs. The [quickstart](quickstart.md) and the paper recipes run on a
+  single GPU (H200, B200 or RTX PRO 6000); multi-node runs need RDMA-capable interconnect
+  for Mooncake.
 
 > **CUDA build matching.** PyPI's default `torch` / `vllm` wheels track the latest CUDA
 > (currently CUDA 13) and will fail to load on an older driver (e.g. `libcudart.so.13: cannot
@@ -104,5 +105,5 @@ export MC_STORE_MEMCPY=0
 Run the smallest example end to end (see [Quickstart](quickstart.md)):
 
 ```bash
-./examples/qwen3-8b-dfly/run.sh training.num_train_steps=20
+./examples/qwen3-8b-dfly-cpt-edr/run.sh training.num_train_steps=20
 ```

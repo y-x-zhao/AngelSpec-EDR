@@ -37,7 +37,10 @@ from omegaconf import OmegaConf  # noqa: E402
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy  # noqa: E402
 
 from angelspec import AutoDraftModelConfig  # noqa: E402
-from angelspec.config.train_config import config_to_flat_args, load_config  # noqa: E402
+from angelspec.config.train_config import (  # noqa: E402
+    config_to_flat_args,
+    load_config,
+)
 from angelspec.config.utils import generate_draft_model_config  # noqa: E402
 from angelspec.controller import (  # noqa: E402
     AsyncTrainingController,
@@ -270,12 +273,55 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
     validate_dflash_usp_layout(
         attention_backend=getattr(args, "attention_backend", None),
     )
-    block_size = getattr(args, "dflash_block_size", 16)
-    min_loss = getattr(args, "min_loss_tokens", 0)
-    if min_loss < 2 * block_size:
+    # dflash_block_size counts learned proposals; the input anchor adds one query slot.
+    block_size = getattr(args, "dflash_block_size", 7)
+    loss_objective = str(getattr(args, "dflash_loss_objective", "decay")).lower()
+    query_includes_anchor = bool(getattr(args, "dflash_query_includes_input_anchor", False))
+    full_anchor_backprop = bool(
+        getattr(args, "dflash_edr_full_anchor_backprop", False)
+    )
+    if full_anchor_backprop and loss_objective != "edr":
         raise ValueError(
-            f"DFlash requires dataset.min_loss_tokens >= 2 * training.dflash_block_size "
-            f"({min_loss} < {2 * block_size}). Set dataset.min_loss_tokens={2 * block_size}."
+            "training.dflash_edr_full_anchor_backprop is supported only with "
+            "training.dflash_loss_objective=edr."
+        )
+    if block_size < 1:
+        raise ValueError("training.dflash_block_size must be >= 1.")
+    # The draft checkpoint's block_size is its query width.
+    configured_block_size = getattr(draft_model_config, "block_size", None)
+    if (
+        query_includes_anchor
+        and configured_block_size is not None
+        and int(configured_block_size) != int(block_size) + 1
+    ):
+        raise ValueError(
+            "training.dflash_block_size + 1 must match the draft checkpoint block_size when "
+            "dflash_query_includes_input_anchor=true "
+            f"({block_size} + 1 != {configured_block_size})."
+        )
+    proposal_width = block_size
+    min_loss = getattr(args, "min_loss_tokens", 0)
+    if min_loss < 2 * proposal_width:
+        raise ValueError(
+            "DFlash requires dataset.min_loss_tokens >= 2 * the learned proposal width "
+            f"({min_loss} < {2 * proposal_width}). "
+            f"Set dataset.min_loss_tokens={2 * proposal_width}."
+        )
+
+    from angelspec.config.distillation import configure_dflash_distillation
+    from angelspec.config.edr import configure_dflash_edr
+
+    configure_dflash_edr(args)
+    configure_dflash_distillation(args)
+
+    # Row grouping and step-wide length sorting are implemented only by
+    # angelspec.train_single_gpu.
+    for key in ("dflash_distill_cross_row_batch_size", "dflash_edr_cross_row_batch_size"):
+        if int(getattr(args, key, 1)) != 1:
+            raise ValueError(f"training.{key} > 1 is supported only by angelspec.train_single_gpu")
+    if getattr(args, "length_balance_optimizer_step", False):
+        raise ValueError(
+            "training.length_balance_optimizer_step is supported only by angelspec.train_single_gpu"
         )
 
     # Auto-set aux layer IDs from draft config if not explicitly provided
@@ -453,6 +499,8 @@ def train_async_no_generation(args):
 
     # [5] Auto-calculate training steps (needs dataset_size)
     with timer.phase("Auto-calculate training steps"):
+        if getattr(args, "epoch_cache_dirs", None):
+            args.epoch_dataset_sizes = ray.get(controller.get_epoch_dataset_sizes.remote())
         auto_calculate_training_steps(args, dataset_size)
 
     # [6] Generate vocab mapping on controller if vocab pruning is enabled

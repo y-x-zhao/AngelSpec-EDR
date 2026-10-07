@@ -1,25 +1,23 @@
 # Quickstart
 
-This walks through training a **DFly** draft model for **Qwen3-8B** on a single node — the
-recommended entry point for first-time users.
+This walks through EDR finetuning of the released **DFly** draft model for **Qwen3-8B**
+(`AngelSlim/Qwen3-8B-DFly-Block8`), one of the paper's experiments.
 
 ## Prerequisites
 
-- 8 GPUs (4 for inference, 4 for training)
-- Access to `Qwen/Qwen3-8B` on HuggingFace
+- One NVIDIA H200 (as in the paper), B200 or RTX PRO 6000 GPU (single-process HF target + draft)
+- Local copies of `Qwen/Qwen3-8B` and `AngelSlim/Qwen3-8B-DFly-Block8`, plus the prepared
+  training cache — see [`examples/qwen3-8b-dfly-cpt-edr`](../../examples/qwen3-8b-dfly-cpt-edr/)
 - AngelSpec installed ([Installation](installation.md))
 
 ## Run it
 
 ```bash
-./examples/qwen3-8b-dfly/run.sh
+./examples/qwen3-8b-dfly-cpt-edr/run.sh
 ```
 
-This launches AngelSpec with `configs/vllm_qwen3_8b_dfly.yaml`:
-
-- **Inference:** 4 GPUs serving the target model via vLLM (tp=2, 2 engines)
-- **Training:** 4 GPUs training the DFly draft model under FSDP2
-- Hidden states flow inference → Mooncake → trainer
+This launches `angelspec.train_single_gpu` with `configs/vllm_qwen3_8b_dfly_edr.yaml` on one
+GPU (no Ray, Mooncake or vLLM). The global batch is 96 (micro batch 1 x 96 accumulation steps).
 
 ## Common overrides
 
@@ -27,40 +25,37 @@ Config values can be overridden directly on the command line:
 
 ```bash
 # Shorter run
-./examples/qwen3-8b-dfly/run.sh training.num_train_steps=50
+./examples/qwen3-8b-dfly-cpt-edr/run.sh training.num_train_steps=50
 
 # Different learning rate
-./examples/qwen3-8b-dfly/run.sh training.learning_rate=2e-5
+./examples/qwen3-8b-dfly-cpt-edr/run.sh training.learning_rate=2e-5
 
-# Use fewer GPUs (4 total: 2 inference + 2 training)
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./examples/qwen3-8b-dfly/run.sh \
-    training.training_num_gpus_per_node=2 \
-    inference.inference_num_gpus=2
+# Select one GPU on a multi-GPU host (the launcher requires exactly one visible GPU)
+CUDA_VISIBLE_DEVICES=0 ./examples/qwen3-8b-dfly-cpt-edr/run.sh
 ```
 
 ## What happens under the hood
 
-The inference GPUs prefill the target model and extract hidden states from selected layers.
-Those tensors are written to the Mooncake store; the training GPUs pull them and run the DFly
-draft model's forward/backward. See [Disaggregated Architecture](../concepts/disaggregated_architecture.md)
-for the full picture.
+A frozen Hugging Face copy of the target model prefills cached, target-regenerated training
+conversations and extracts hidden states from selected layers on the same GPU; the DFly draft
+model then runs its forward/backward on those tensors directly. The disaggregated multi-GPU
+pipeline is described in [Disaggregated Architecture](../concepts/disaggregated_architecture.md)
+but is not used by the paper recipes.
 
-## Other architectures
+## Other recipes
 
-To train a different draft architecture on the same target, swap the example:
+The other paper recipes are the E2E baseline for the same drafter and the Qwen3-4B DSpark pair:
 
 ```bash
-# MTP (with sequence packing + USP)
-./examples/qwen3-8b-mtp/run.sh
-
-# DSpark (from scratch)
-./examples/qwen3-8b-dspark/run.sh
+./examples/qwen3-8b-dfly-cpt-e2e/run.sh
+./examples/qwen3-4b-dspark-edr/run.sh
+./examples/qwen3-4b-dspark-e2e/run.sh
 ```
 
 See [The Draft-Model Family](../concepts/draft_model_family.md) for architecture details.
 
 ## Next steps
 
-- Continue training from a released checkpoint: [`examples/qwen3-8b-dfly-cpt`](../../examples/qwen3-8b-dfly-cpt/)
+- Evaluate MAL offline: [`examples/eval`](../../examples/eval/)
 - Scale to multi-node: [Multi-Node Training](../advanced_features/multi_node.md)
 - Convert a checkpoint for serving: [Checkpoint Conversion](../basic_usage/checkpoint_conversion.md)

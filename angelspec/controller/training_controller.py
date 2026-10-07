@@ -320,6 +320,9 @@ class AsyncTrainingController:
         self._packing_last_dispatch_fill_ratio = 0.0
 
         self._stored_dataset: list | None = None
+        self._epoch_cache_dataset = None
+        self._epoch_submitted_samples = 0
+        self._epoch_returned_samples = 0
         self._stored_eval_dataset: list | None = None
         self._dataset_epoch: int = 0
         self._dataset_seed: int = getattr(args, "seed", 42)
@@ -373,7 +376,15 @@ class AsyncTrainingController:
         """Load and store dataset on the controller for later use."""
         from angelspec.data.dataset import load_conversation_dataset
 
-        self._stored_dataset = load_conversation_dataset(args)
+        if getattr(args, "epoch_cache_dirs", None):
+            from angelspec.data.epoch_cache import EpochCachedDataset
+
+            # Read only cache metadata here. The checkpoint's global_step selects
+            # the active cache when the loop submits its first epoch.
+            self._epoch_cache_dataset = EpochCachedDataset(args)
+            self._stored_dataset = self._epoch_cache_dataset
+        else:
+            self._stored_dataset = load_conversation_dataset(args)
         if not self._stored_dataset:
             raise ValueError(
                 f"Training dataset is empty after processing. "
@@ -383,6 +394,11 @@ class AsyncTrainingController:
             )
         logger.info(f"Controller loaded dataset: {len(self._stored_dataset)} samples")
         return len(self._stored_dataset)
+
+    def get_epoch_dataset_sizes(self) -> list[int] | None:
+        if self._epoch_cache_dataset is None:
+            return None
+        return list(self._epoch_cache_dataset.sizes)
 
     def _prepare_dataset(self, skip: int = 0) -> list:
         """Return dataset for the current epoch, optionally shuffled.
@@ -399,6 +415,16 @@ class AsyncTrainingController:
 
             rng = random.Random(self._dataset_seed + self._dataset_epoch)
             rng.shuffle(data)
+
+        epoch_cache = getattr(self, "_epoch_cache_dataset", None)
+        if epoch_cache is not None:
+            batch_size = epoch_cache.args.global_batch_size
+            usable = len(data) // batch_size * batch_size
+            if skip < 0 or skip > usable or skip % batch_size:
+                raise ValueError("Epoch cache resume skip must identify a completed global batch")
+            # Drop the last partial batch before async inference so its features
+            # cannot carry over into the next epoch.
+            data = data[:usable]
 
         if skip > 0:
             skip = min(skip, len(data))
@@ -423,14 +449,33 @@ class AsyncTrainingController:
             skip: Number of samples to skip from the start (for resume mid-epoch).
         """
         assert self._stored_dataset is not None, "No stored dataset to submit"
+        epoch_cache = getattr(self, "_epoch_cache_dataset", None)
+        if epoch_cache is not None:
+            if self._epoch_submitted_samples:
+                self._assert_epoch_cache_drained()
+            epoch_cache.activate(epoch)
         self._dataset_epoch = epoch
-        return self.add_dataset(self._prepare_dataset(skip=skip))
+        data = self._prepare_dataset(skip=skip)
+        if epoch_cache is not None:
+            self._epoch_submitted_samples = len(data)
+            self._epoch_returned_samples = 0
+        return self.add_dataset(data)
+
+    def _assert_epoch_cache_drained(self) -> None:
+        if (
+            self.prompt_buffer or self.sample_pool
+            or self._epoch_returned_samples != self._epoch_submitted_samples
+        ):
+            raise RuntimeError(
+                "Cannot switch epoch cache with unconsumed or in-flight training samples: "
+                f"returned={self._epoch_returned_samples}/{self._epoch_submitted_samples}, "
+                f"prompts={len(self.prompt_buffer)}, pool={len(self.sample_pool)}"
+            )
 
     def reload_dataset(self) -> int:
         """Re-add the stored dataset to the prompt buffer (epoch reload)."""
         assert self._stored_dataset is not None, "No stored dataset to reload"
-        self._dataset_epoch += 1
-        return self.add_dataset(self._prepare_dataset())
+        return self.submit_training_dataset(epoch=self._dataset_epoch + 1)
 
     def load_eval_dataset(self, args) -> int:
         """Load eval dataset on the controller and store it. Returns size (0 if none)."""
@@ -477,6 +522,8 @@ class AsyncTrainingController:
         from angelspec.data.preprocessing import generate_vocab_mapping
 
         assert self._stored_dataset is not None, "No stored dataset for vocab mapping"
+        if self._epoch_cache_dataset is not None:
+            self._epoch_cache_dataset.activate(0)
         assert (
             "input_ids" in self._stored_dataset[0]
         ), "compute_vocab_mapping requires input_ids in dataset. Set defer_tokenization=False to enable tokenization."
@@ -534,6 +581,10 @@ class AsyncTrainingController:
         pool_bytes = 0
         if train_results:
             with self._pool_lock:
+                if self._epoch_cache_dataset is not None:
+                    self._epoch_returned_samples += len(train_results)
+                    if self._epoch_returned_samples > self._epoch_submitted_samples:
+                        raise RuntimeError("Inference returned more rows than the submitted epoch cache")
                 for result in train_results:
                     sample_bytes = estimate_tensor_bytes(
                         result.tensor_shapes or {},
@@ -915,6 +966,8 @@ class AsyncTrainingController:
             "sample_pool_size": len(self.sample_pool),
             "batches_dispatched": self.batch_id,
             "dispatch_batch_size": self.dispatch_batch_size,
+            "epoch_submitted_samples": self._epoch_submitted_samples,
+            "epoch_returned_samples": self._epoch_returned_samples,
             "packing_last_dispatch_fill_ratio": self._packing_last_dispatch_fill_ratio,
             "packing_low_fill_flushes": self._packing_low_fill_flushes,
             "packing_wait_seconds_total": round(self._packing_wait_seconds_total, 3),

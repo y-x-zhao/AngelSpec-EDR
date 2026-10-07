@@ -377,7 +377,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 (
                     "last_hidden_states",
                     shapes["last_hidden_states"],
-                    dtypes.get("hidden_states", HIDDEN_STATES_STORAGE_DTYPE),
+                    dtypes.get("last_hidden_states", HIDDEN_STATES_STORAGE_DTYPE),
                 )
             )
 
@@ -548,7 +548,11 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             c_array = (ctypes.c_byte * buf_size).from_address(buf.ptr())
             host_tensor = torch.frombuffer(c_array, dtype=dtype, count=numel).reshape(shape)
 
-            tensor_map[name] = host_tensor.to(device)
+            # The frombuffer view borrows Mooncake's native buffer, which is freed
+            # with `buffers`. CPU prefetch keeps tensors after this call (and the
+            # store key is deleted before collation), and .to("cpu") alone would
+            # return the borrowed view, so copy=True makes the tensor own its bytes.
+            tensor_map[name] = host_tensor.to(device, copy=True)
 
             if name == "input_ids":
                 tensor_map["input_ids_cpu"] = host_tensor.clone()

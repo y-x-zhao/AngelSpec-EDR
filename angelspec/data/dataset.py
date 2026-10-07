@@ -19,9 +19,11 @@
 # SOFTWARE.
 
 import hashlib
+import json
 import logging as _logging
 import multiprocessing as mp
 import os
+from pathlib import Path
 
 import torch
 from tqdm import tqdm
@@ -44,6 +46,113 @@ from angelspec.utils.processing import load_tokenizer
 _logging.getLogger("transformers_modules").setLevel(_logging.ERROR)
 
 _worker_state = {}
+
+
+def _find_single_tokenized_cache(cache_dir: str) -> str | None:
+    """Return the sole tokenized ``.pt`` cache, rejecting ambiguity."""
+    if not os.path.isdir(cache_dir):
+        return None
+
+    cache_files = sorted(
+        os.path.join(cache_dir, name)
+        for name in os.listdir(cache_dir)
+        if name.endswith(".pt") and os.path.isfile(os.path.join(cache_dir, name))
+    )
+    if len(cache_files) > 1:
+        raise RuntimeError(
+            f"Expected at most one tokenized dataset cache in {cache_dir}, "
+            f"found {len(cache_files)}: {cache_files}"
+        )
+    return cache_files[0] if cache_files else None
+
+
+def target_rollout_sampling(args) -> dict | None:
+    """Resolve an explicit rollout policy, or EDR's required on-policy policy."""
+    from angelspec.utils.sampling import validate_sampling_parameters
+
+    is_edr = str(getattr(args, "dflash_loss_objective", "decay")).lower() == "edr"
+    configured = getattr(args, "target_sampling", None)
+    if configured is None and not is_edr:
+        return None
+    edr_sampling = {
+        "temperature": getattr(args, "dflash_edr_temperature", 1.0),
+        "top_k": getattr(args, "dflash_edr_top_k", -1),
+        "top_p": getattr(args, "dflash_edr_top_p", 1.0),
+    }
+    sampling = dict(configured) if configured is not None else dict(edr_sampling)
+    sampling.setdefault("min_p", 0.0)
+    sampling.setdefault("enable_thinking", False)
+    validate_sampling_parameters(sampling["temperature"], sampling["top_k"], sampling["top_p"])
+    if sampling["min_p"] != 0.0 or sampling["enable_thinking"] is not False:
+        raise ValueError("Target rollout caches currently require min_p=0 and enable_thinking=false")
+    if is_edr and any(sampling[key] != value for key, value in edr_sampling.items()):
+        raise ValueError("dataset.target_sampling must match the EDR temperature/top-k/top-p")
+    return sampling
+
+
+def find_tokenized_cache_for_training(args) -> str | None:
+    """Return the tokenized cache to train on, or None if none matches.
+
+    Without a target sampling policy, the single ``.pt`` cache in cache_dir is
+    used. With a policy, a cache matches when its provenance file (the
+    ``.pt.json`` sidecar, or else ``target_rollout_work/<stem>/manifest.json``)
+    is complete and records the same target model and sampling. Filenames alone
+    do not establish provenance. The ``.pt`` payload is not read or hashed.
+    """
+    cache_root = Path(getattr(args, "cache_dir", "./cache"))
+    cache_dir = cache_root / "tokenized_dataset"
+    policy = target_rollout_sampling(args)
+    if policy is None:
+        return _find_single_tokenized_cache(str(cache_dir))
+
+    from angelspec.utils.sampling import target_model_cache_id
+
+    expected_model = target_model_cache_id(args.target_model_path)
+    expected_sampling = {
+        **{key: value for key, value in policy.items() if key != "min_p"},
+        "n": 1,
+        "max_total_tokens": args.max_seq_length,
+    }
+
+    matching = []
+    for cache_path in sorted(cache_dir.glob("*.pt")):
+        if not cache_path.is_file():
+            continue
+        metadata_path = cache_path.with_suffix(".pt.json")
+        if not metadata_path.is_file():
+            metadata_path = (
+                cache_root / "target_rollout_work" / cache_path.stem / "manifest.json"
+            )
+        if not metadata_path.is_file():
+            continue
+        try:
+            with metadata_path.open(encoding="utf-8") as handle:
+                metadata = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Cannot read EDR cache provenance: {metadata_path}") from exc
+        if not isinstance(metadata, dict):
+            raise RuntimeError(f"Invalid EDR cache provenance: {metadata_path}")
+        sampling = metadata.get("sampling")
+        model = metadata.get("target_model")
+        if (
+            metadata.get("status") != "complete"
+            or metadata.get("artifact_name") != cache_path.name
+            or not isinstance(model, str)
+            or target_model_cache_id(model) != expected_model
+            or not isinstance(sampling, dict)
+            # A missing min_p means 0, the only value the regeneration tool uses.
+            or sampling.get("min_p", 0.0) != policy["min_p"]
+            or any(sampling.get(key) != value for key, value in expected_sampling.items())
+        ):
+            continue
+        matching.append(str(cache_path))
+
+    if len(matching) > 1:
+        raise RuntimeError(
+            f"Multiple target-generated EDR caches match model/sampling in {cache_dir}: "
+            f"{matching}. Select a dedicated cache_dir containing one matching artifact."
+        )
+    return matching[0] if matching else None
 
 
 def _init_tokenize_worker(
@@ -158,20 +267,17 @@ def load_conversation_dataset(args):
     """
     prompt_key = getattr(args, "prompt_key", "text")
     chat_template_name = getattr(args, "chat_template", None)
-    # Reserve 1 token: the inference engine must generate >=1 token to extract
-    # hidden states, so a prompt of exactly max_seq_length is rejected
-    # (prompt_len + 1 > max_model_len). Truncating to max_seq_length - 1 keeps
-    # the vast majority of samples out of the engine-side length skip guard.
-    max_length = args.max_seq_length - 1
+    # By default the limit is max_seq_length - 1, reserving vLLM's feature-extraction
+    # output slot. With allow_full_length_cached_sequences, cached sequences may use
+    # max_seq_length tokens and vLLM gets that slot outside the training limit.
+    full_length_cache = bool(getattr(args, "allow_full_length_cached_sequences", False))
+    max_length = args.max_seq_length - int(not full_length_cache)
     defer_tokenization = getattr(args, "defer_tokenization", False)
 
     logger.info(f"Max sequence length allowed for training: {max_length}")
 
     if not chat_template_name:
         raise ValueError("chat_template must be set for load_conversation_dataset")
-
-    custom_template = TEMPLATE_REGISTRY.get(chat_template_name)
-    hf_dataset = load_hf_dataset(args.train_data_path)
 
     dataset_name = os.path.basename(args.train_data_path)
     file_stat = ""
@@ -192,11 +298,38 @@ def load_conversation_dataset(args):
     cache_dir = os.path.join(getattr(args, "cache_dir", "./cache"), "tokenized_dataset")
     cache_path = os.path.join(cache_dir, f"{cache_key}.pt")
 
-    if os.path.exists(cache_path):
-        logger.info(f"Loading dataset from cache: {cache_path}")
-        prompts = torch.load(cache_path, weights_only=False)
+    policy = target_rollout_sampling(args)
+    existing_cache_path = find_tokenized_cache_for_training(args)
+    if existing_cache_path is not None:
+        if policy is not None:
+            logger.info("Loading matching target-generated cache: %s", existing_cache_path)
+        else:
+            logger.info(
+                "Loading sole tokenized dataset cache without validating its hash: "
+                f"{existing_cache_path}"
+            )
+        prompts = torch.load(existing_cache_path, weights_only=False)
         logger.info(f"Loaded {len(prompts)} cached samples")
         return prompts
+
+    if policy is not None:
+        raise FileNotFoundError(
+            f"No completed target-generated cache in {cache_dir} matches target model "
+            f"{args.target_model_path!r}, sampling={policy}, "
+            f"max_total_tokens={args.max_seq_length}. Run tools/regenerate_perfectblend.py "
+            "with matching --target-model, --temperature, --top-k, --top-p, "
+            "--max-total-tokens and --cache-dir. Keep its .pt.json sidecar (or a completed "
+            "legacy rollout manifest). This recipe never falls back to source assistant responses."
+        )
+
+    if full_length_cache:
+        raise FileNotFoundError(
+            "dataset.allow_full_length_cached_sequences requires an existing "
+            f"tokenized cache in {cache_dir}; it never falls back to raw-source tokenization"
+        )
+
+    custom_template = TEMPLATE_REGISTRY.get(chat_template_name)
+    hf_dataset = load_hf_dataset(args.train_data_path)
 
     mode_label = "Formatting" if defer_tokenization else "Tokenizing"
     logger.info(f"{mode_label} dataset (cache will be saved to {cache_path})")

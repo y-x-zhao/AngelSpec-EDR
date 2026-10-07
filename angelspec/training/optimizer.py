@@ -77,6 +77,7 @@ class BF16Optimizer:
         muon_nesterov=True,
         muon_ns_steps=5,
         muon_matched_adamw_rms=0.2,
+        warmup_steps=None,
     ):
         self.model = model
         self.optimizer_type = optimizer_type.lower()
@@ -135,7 +136,7 @@ class BF16Optimizer:
             self.optimizer,
             max_lr=lr,
             total_steps=total_steps,
-            warmup_steps=int(warmup_ratio * total_steps),
+            warmup_steps=int(warmup_ratio * total_steps) if warmup_steps is None else warmup_steps,
             decay_style=decay_style,
             min_lr=min_lr,
             wsd_decay_steps=wsd_decay_steps,
@@ -190,6 +191,10 @@ class BF16Optimizer:
 
         Returns:
             grad_norm: The gradient norm before clipping (for logging).
+
+        Raises:
+            RuntimeError: If the gradient norm is non-finite, before updating
+                weights, optimizer state, or the learning-rate scheduler.
         """
         with torch.no_grad():
             for p, mp, g in zip(self.model_params, self.fp32_params, self.fp32_grads):
@@ -199,7 +204,12 @@ class BF16Optimizer:
                 else:
                     mp.grad = None
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
+        # Check the aggregate norm before clipping or mutating optimizer state.
+        # Keep DTensor's global reduction: a rank-local finite check could let
+        # peers enter Muon collectives after another rank has already failed.
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.fp32_params, self.max_grad_norm, error_if_nonfinite=True
+        )
         if grad_norm > 0.0:
             if self.optimizer_type == "muon":
                 self._muon_update()

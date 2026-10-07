@@ -1,0 +1,121 @@
+# Pure end-to-end TV (E2E) baseline for the released Qwen3-8B DFly Block8 draft.
+# Matches vllm_qwen3_8b_dfly_edr.yaml in initialization, data, seed, seven
+# learned proposals, 512 anchors, optimizer schedule and 96-sample global batch.
+# Single GPU (paper: one NVIDIA H200). run.sh raises the row group and vocab
+# tile on H200/B200; RTX PRO 6000 uses the values below.
+model:
+  target_model_path: ./target_models/Qwen3-8B
+  target_model_backend: hf
+  trust_remote_code: true
+  draft_model_config: angelspec/config/dfly_qwen3_8b_draft_config.json
+  lm_head_key: lm_head.weight
+
+dataset:
+  # One target-regenerated cache per epoch (tools/regenerate_perfectblend.py
+  # --training-config <this file> --epoch 1 writes ${cache_dir}/epoch1).
+  epoch_cache_dirs: ["${cache_dir}/epoch1"]
+  train_data_path: ../dataset/Open-PerfectBlend/open-perfectblend.jsonl
+  eval_data_path: null
+  chat_template: qwen
+  prompt_key: conversations
+  # Same filter as the EDR config (seven proposals require at least 14).
+  min_loss_tokens: 32
+  shuffle_dataset: true
+  # Regenerated rows may use every input slot (prompt + response <= max_seq_length).
+  allow_full_length_cached_sequences: true
+  # Target rollout policy (paper Sec. 5.1: T=1, no top-p/top-k, non-thinking).
+  # Selects the matching regenerated cache; EDR and distribution-aware E2E use
+  # it as the target distribution.
+  target_sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    enable_thinking: false
+
+training:
+  # Fallback initialization only. run.sh resumes full state from the output
+  # directory's tracker when present.
+  load_path: ./draft_checkpoints/Qwen3-8B-DFly-Block8
+  continual_training: true
+
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  # Global batch = 1 microbatch * 1 GPU * 96 accumulation steps = 96.
+  draft_accumulation_steps: 96
+  # Four independently normalized rows per model call; the optimizer batch is
+  # 96 samples. run.sh uses 6 rows on H200 and 8 on B200.
+  dflash_distill_cross_row_batch_size: 4
+  length_balance_optimizer_step: true
+  learning_rate: 3e-5
+  min_lr: 3e-6
+  lr_decay_style: constant  # Linear warmup, then no decay (paper Table 3).
+  weight_decay: 0.01
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 4096
+  num_epochs: 1
+  num_train_steps: null
+  seed: 42
+  ttt_length: 7
+
+  # Single-GPU training requires unsharded (REPLICATE) parameters.
+  fsdp_strategy: REPLICATE
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 0  # Single GPU: target features are computed in-process.
+  warmup_ratio: 0.04  # 4% linear warmup (paper Table 3).
+  save_interval: 1000
+  save_per_epoch: true
+  max_checkpoints: 60
+  distributed_timeout_minutes: 30
+
+  training_num_nodes: 1
+  training_num_gpus_per_node: 1
+
+  # Seven learned proposals (block_size); the input anchor adds an eighth,
+  # physical query slot (released Block8 layout).
+  dflash_block_size: 7
+  dflash_query_includes_input_anchor: true
+  dflash_num_target_layers: 5
+  dflash_num_anchors: 512
+  # Streamed TV upcasts one vocabulary tile at a time, so the LM-head output
+  # stays in BF16.
+  dflash_fp32_lm_head: false
+
+  # Pure E2E TV: CE and every auxiliary objective have zero weight, so the
+  # decay objective selector has no effect.
+  dflash_loss_objective: decay
+  # TV uses the dataset.target_sampling target distribution (unfiltered T=1 when
+  # unset). false uses full-vocabulary target/draft T=1; cache selection is
+  # the same either way.
+  dflash_distill_distribution_aware: true
+  dflash_loss_decay_gamma: 0.0
+  dflash_ce_loss_alpha: 0.0
+  dflash_l1_loss_alpha: 0.0
+  dflash_kl_loss_weight: 0.0
+  dflash_lk_loss_weight: 0.0
+  dflash_e2e_tv_loss_weight: 1.0
+  # Three streamed probability tiles for Qwen3's vocabulary; run.sh uses two
+  # (131072) on H200/B200.
+  dflash_edr_vocab_chunk_size: 65536
+  dflash_gate_entropy_weight: 0.0
+  dflash_packing: false
+  dflash_packing_token_weighted_loss: false
+
+inference:
+  # Single-GPU HF target features are pre-final-norm last hidden states, the
+  # same contract as the vLLM feature cache. No inference engine is started.
+  store_last_hidden_states: true
+  last_hidden_states_prenorm: true
+
+output_dir: ./outputs/qwen3-8b-dfly-cpt-e2e
+cache_dir: ./dataset/Open-PerfectBlend/cache/qwen3-8b
+model_download_dir: null
+
+logging:
+  report_to: none
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

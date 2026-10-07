@@ -7,6 +7,7 @@ hidden-states correction (TreeFlash formula (1)) is applied at train time by the
 ``DFlyModel`` wrapper's ``_compute_draft_logits`` hook.
 """
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -15,10 +16,19 @@ import torch.nn.functional as F
 
 from angelspec.models.draft.dflare import DFlareDraftModel
 from angelspec.models.draft.dflash import (
+    DFlashAttentionContextCache,
     DFlashConfig,
     DFlashDecoderLayer,
     DFlashRMSNorm,
 )
+
+
+@dataclass(frozen=True)
+class DFlyContextCache:
+    """Per-layer context K/V reused by independent EDR query blocks."""
+
+    layer_caches: tuple[DFlashAttentionContextCache, ...]
+    hidden_dtype: torch.dtype
 
 
 class DFlyConfig(DFlashConfig):
@@ -124,6 +134,8 @@ class DFlyDraftModel(DFlareDraftModel):
     """
 
     config_class = DFlyConfig
+    # DFly uses DFlash attention layers and provides its own fused cache builder.
+    supports_context_cache = True
 
     def __init__(self, config):
         super().__init__(config)
@@ -169,6 +181,78 @@ class DFlyDraftModel(DFlareDraftModel):
         )
         return self.context_norm(base_context + residual_context)
 
+    def _validate_context_feature(self, context_feature: torch.Tensor) -> None:
+        if context_feature.ndim != 4:
+            raise ValueError(
+                "DFly context_feature must have shape [B, S, T, D], "
+                f"got {tuple(context_feature.shape)}"
+            )
+        if context_feature.shape[2] != self.num_target_layers:
+            raise ValueError(
+                f"Expected {self.num_target_layers} target layers, "
+                f"got {context_feature.shape[2]}"
+            )
+
+    def prepare_context_cache(
+        self,
+        context_feature: torch.Tensor,
+        context_position_ids: torch.Tensor,
+        rope_sequence_length: Optional[int] = None,
+    ) -> DFlyContextCache:
+        """Build anchor-independent context K/V once for repeated EDR queries."""
+        self._validate_context_feature(context_feature)
+        if context_position_ids.shape != context_feature.shape[:2]:
+            raise ValueError("context_position_ids must match the DFly context shape")
+
+        base_context = self._project_base_context(context_feature)
+        layer_caches = []
+        for layer_idx, layer in enumerate(self.layers):
+            layer_context = self._build_layer_context(
+                context_feature,
+                base_context,
+                layer_idx,
+            )
+            layer_caches.append(
+                layer.self_attn.prepare_context_cache(
+                    layer_context,
+                    context_position_ids,
+                    rope_sequence_length=rope_sequence_length,
+                )
+            )
+        return DFlyContextCache(
+            layer_caches=tuple(layer_caches),
+            hidden_dtype=base_context.dtype,
+        )
+
+    def forward_with_context_cache(
+        self,
+        *,
+        draft_input_ids: Optional[torch.Tensor],
+        context_cache: DFlyContextCache,
+        draft_position_ids: torch.Tensor,
+        context_position_ids: torch.Tensor,
+        block_mask=None,
+        noise_embedding: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run only anchor-dependent draft work against prepared context K/V."""
+        if len(context_cache.layer_caches) != len(self.layers):
+            raise ValueError("DFly context cache does not match the number of draft layers")
+        if noise_embedding is not None:
+            draft_hidden = noise_embedding.to(context_cache.hidden_dtype)
+        else:
+            draft_hidden = self.embed_tokens(draft_input_ids).to(context_cache.hidden_dtype)
+
+        for layer, layer_cache in zip(self.layers, context_cache.layer_caches):
+            draft_hidden = layer(
+                draft_hidden=draft_hidden,
+                context_hidden=None,
+                draft_position_ids=draft_position_ids,
+                context_position_ids=context_position_ids,
+                block_mask=block_mask,
+                context_cache=layer_cache,
+            )
+        return self.final_norm(draft_hidden)
+
     def forward(
         self,
         draft_input_ids: Optional[torch.Tensor],
@@ -179,14 +263,7 @@ class DFlyDraftModel(DFlareDraftModel):
         noise_embedding: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the draft model with FC + fusion-residual context per layer."""
-        if context_feature.ndim != 4:
-            raise ValueError(
-                f"DFly context_feature must have shape [B, S, T, D], got {tuple(context_feature.shape)}"
-            )
-        if context_feature.shape[2] != self.num_target_layers:
-            raise ValueError(
-                f"Expected {self.num_target_layers} target layers, got {context_feature.shape[2]}"
-            )
+        self._validate_context_feature(context_feature)
 
         base_context = self._project_base_context(context_feature)
         if noise_embedding is not None:

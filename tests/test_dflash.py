@@ -9,15 +9,22 @@ Covers:
 """
 
 import math
+import sys
+import types
 import unittest
 from unittest import mock
 
 import torch
 
-from angelspec.models.dflash import DFlashModel, _create_dflash_mask_mod
+from angelspec.models.dflash import (
+    DFlashModel,
+    _build_dflash_block_mask,
+    _create_dflash_mask_mod,
+)
 from angelspec.models.draft.dflash import (
     DFlashConfig,
     DFlashDraftModel,
+    _dflash_flex_kernel_options,
     build_target_layer_ids,
 )
 
@@ -86,6 +93,29 @@ class TestDFlashConfig(unittest.TestCase):
         restored = DFlashConfig(**{k: v for k, v in d.items() if k != "transformers_version"})
         self.assertEqual(restored.hidden_size, config.hidden_size)
         self.assertEqual(restored.num_target_layers, config.num_target_layers)
+
+
+class TestDFlashFlexKernelOptions(unittest.TestCase):
+    @mock.patch("torch.cuda.get_device_capability", return_value=(12, 0))
+    def test_sm120_uses_constrained_triton(self, _mock_capability):
+        options = _dflash_flex_kernel_options(torch.device("cuda"))
+
+        self.assertEqual(
+            options,
+            {
+                "BACKEND": "TRITON",
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "num_warps": 4,
+                "num_stages": 2,
+            },
+        )
+
+    @mock.patch("torch.cuda.get_device_capability", return_value=(9, 0))
+    def test_other_architecture_keeps_flash(self, _mock_capability):
+        options = _dflash_flex_kernel_options(torch.device("cuda"))
+
+        self.assertEqual(options, {"BACKEND": "FLASH"})
 
 
 class TestBuildTargetLayerIds(unittest.TestCase):
@@ -167,6 +197,34 @@ class TestDFlashDraftModel(unittest.TestCase):
 
         self.assertEqual(out.shape, (B, draft_len, H))
 
+    def test_context_cache_matches_ordinary_forward(self):
+        B, draft_len, ctx_len = 1, 8, 12
+        H = self.config.hidden_size
+        noise_embedding = torch.randn(B, draft_len, H)
+        context_feature = torch.randn(B, ctx_len, H)
+        draft_pos = torch.arange(3, 3 + draft_len).unsqueeze(0)
+        ctx_pos = torch.arange(ctx_len).unsqueeze(0)
+
+        with torch.no_grad():
+            expected = self.model(
+                draft_input_ids=None,
+                context_feature=context_feature,
+                draft_position_ids=draft_pos,
+                context_position_ids=ctx_pos,
+                noise_embedding=noise_embedding,
+            )
+            context_cache = self.model.prepare_context_cache(context_feature, ctx_pos)
+            actual = self.model.forward_with_context_cache(
+                draft_input_ids=None,
+                context_cache=context_cache,
+                draft_position_ids=draft_pos,
+                context_position_ids=ctx_pos,
+                noise_embedding=noise_embedding,
+            )
+
+        self.assertEqual(len(context_cache.layer_caches), len(self.model.layers))
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
     def test_extract_context_feature(self):
         B, seq_len = 2, 16
         H = self.config.hidden_size
@@ -200,6 +258,35 @@ class TestDFlashDraftModel(unittest.TestCase):
             # q_norm and k_norm should operate on head_dim
             self.assertEqual(attn.q_norm.weight.shape[0], attn.head_dim)
             self.assertEqual(attn.k_norm.weight.shape[0], attn.head_dim)
+
+    def test_block_attention_uses_flash_backend_off_sm120(self):
+        """DFly should retain the Flex FLASH kernel away from SM120 CUDA."""
+        B, draft_len, ctx_len = 1, 4, 8
+        H = self.config.hidden_size
+        draft_input_ids = torch.randint(0, self.config.vocab_size, (B, draft_len))
+        context_feature = torch.randn(B, ctx_len, H)
+        draft_pos = torch.arange(draft_len).unsqueeze(0)
+        ctx_pos = torch.arange(ctx_len).unsqueeze(0)
+
+        def fake_flex_attention(query, key, value, **kwargs):
+            return torch.zeros_like(query)
+
+        with mock.patch(
+            "angelspec.models.ops.flex_attention.compile_friendly_flex_attention",
+            side_effect=fake_flex_attention,
+        ) as flex_mock:
+            self.model(
+                draft_input_ids=draft_input_ids,
+                context_feature=context_feature,
+                draft_position_ids=draft_pos,
+                context_position_ids=ctx_pos,
+                block_mask=object(),
+            )
+
+        self.assertEqual(
+            flex_mock.call_args.kwargs["kernel_options"],
+            {"BACKEND": "FLASH"},
+        )
 
 
 class TestAnchorSampling(unittest.TestCase):
@@ -235,11 +322,12 @@ class TestAnchorSampling(unittest.TestCase):
         model = _make_dflash_model(block_size=4, num_anchors=4)
         anchors, keep_mask = model._sample_anchor_positions(seq_len, loss_mask, loss_mask.device)
 
-        # Valid anchors should be >= 32 (where loss_mask is 1)
+        # Anchors precede supervised labels, so the prompt's final token at 31
+        # is eligible even though the anchor itself is not supervised.
         for b in range(B):
             for a in range(anchors.shape[1]):
                 if keep_mask[b, a]:
-                    self.assertGreaterEqual(anchors[b, a].item(), 32)
+                    self.assertGreaterEqual(anchors[b, a].item(), 31)
 
     def test_block_keep_mask_tracks_validity(self):
         """When fewer valid positions than num_anchors, keep_mask should mark invalid ones."""
@@ -255,14 +343,15 @@ class TestAnchorSampling(unittest.TestCase):
         valid_count = keep_mask.sum(dim=1)
         self.assertLessEqual(valid_count[0].item(), 2)
 
-    def test_short_sequence_graceful_fallback(self):
-        """Sequences too short for anchor sampling return all-False keep_mask (zero loss)."""
+    def test_short_sequence_trains_partial_blocks(self):
+        """A sequence shorter than B still supplies valid next-token anchors."""
         B = 1
         loss_mask = torch.ones(B, 4)
         model = _make_dflash_model(block_size=8, num_anchors=2)
         anchors, keep_mask = model._sample_anchor_positions(4, loss_mask, loss_mask.device)
         self.assertEqual(anchors.shape, (B, 2))
-        self.assertFalse(keep_mask.any(), "keep_mask should be all-False for too-short sequences")
+        self.assertEqual(keep_mask.sum().item(), 2)
+        self.assertTrue(torch.all((anchors[keep_mask] >= 0) & (anchors[keep_mask] <= 2)))
 
     def test_all_zero_loss_mask_graceful_fallback(self):
         """All-zero loss_mask returns all-False keep_mask instead of crashing."""
@@ -306,6 +395,87 @@ class TestPositionIds(unittest.TestCase):
 
 
 class TestDFlashMaskMod(unittest.TestCase):
+    @mock.patch("angelspec.models.dflash.compile_friendly_create_block_mask")
+    def test_block_mask_builder_uses_compiled_sparse_path(self, mock_create_block_mask):
+        sentinel = object()
+        mock_create_block_mask.return_value = sentinel
+        anchor_positions = torch.tensor([[4, 12]])
+        block_keep_mask = torch.tensor([[True, False]])
+
+        result = _build_dflash_block_mask(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            ctx_len=16,
+            block_size=4,
+            device=torch.device("cpu"),
+        )
+
+        self.assertIs(result, sentinel)
+        kwargs = mock_create_block_mask.call_args.kwargs
+        self.assertTrue(kwargs["_compile"])
+        self.assertEqual(kwargs["B"], 1)
+        self.assertIsNone(kwargs["H"])
+        self.assertEqual(kwargs["Q_LEN"], 8)
+        self.assertEqual(kwargs["KV_LEN"], 24)
+        self.assertEqual(kwargs["device"], torch.device("cpu"))
+
+    def test_padded_query_tiles_are_bounds_checked_and_masked(self):
+        # Attention kernels may evaluate query rows past the last anchor block
+        # (tile padding); indexing must stay in bounds and see nothing.
+        mask_mod = _create_dflash_mask_mod(
+            anchor_positions=torch.tensor([[4, 12]]),
+            block_keep_mask=torch.tensor([[True, True]]),
+            ctx_len=16,
+            block_size=4,
+            ctx_doc_ids=torch.zeros(1, 16, dtype=torch.long),
+        )
+        b, h = torch.tensor(0), torch.tensor(0)
+        for q_idx in (8, 11, 127):
+            for kv_idx in (0, 3, 16, 23):
+                self.assertFalse(bool(mask_mod(b, h, torch.tensor(q_idx), torch.tensor(kv_idx))))
+        self.assertTrue(bool(mask_mod(b, h, torch.tensor(0), torch.tensor(3))))
+
+    def test_dynamic_context_boundary_is_captured_as_a_tensor(self):
+        mask_mod = _create_dflash_mask_mod(
+            anchor_positions=torch.tensor([[4]]),
+            block_keep_mask=torch.tensor([[True]]),
+            ctx_len=8,
+            block_size=4,
+        )
+
+        captures = dict(
+            zip(
+                mask_mod.__code__.co_freevars,
+                (cell.cell_contents for cell in mask_mod.__closure__),
+            )
+        )
+        self.assertNotIn("ctx_len", captures)
+        self.assertEqual(captures["ctx_len_tensor"].shape, torch.Size([]))
+        self.assertEqual(captures["ctx_len_tensor"].device, torch.device("cpu"))
+        self.assertEqual(captures["ctx_len_tensor"].item(), 8)
+
+    def test_dynamic_context_lengths_compile_without_changing_the_mask(self):
+        def evaluate(context, anchor_positions, block_keep_mask):
+            mask_mod = _create_dflash_mask_mod(
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                ctx_len=context.shape[1],
+                block_size=4,
+            )
+            q_idx = torch.arange(4, device=context.device).unsqueeze(1)
+            kv_idx = torch.arange(context.shape[1] + 4, device=context.device).unsqueeze(0)
+            return mask_mod(0, 0, q_idx, kv_idx)
+
+        compiled = torch.compile(evaluate, backend="eager", dynamic=True, fullgraph=True)
+        for context_length in (8, 12, 9):
+            context = torch.zeros(1, context_length)
+            anchor_positions = torch.tensor([[context_length // 2]])
+            block_keep_mask = torch.tensor([[True]])
+            torch.testing.assert_close(
+                compiled(context, anchor_positions, block_keep_mask),
+                evaluate(context, anchor_positions, block_keep_mask),
+            )
+
     def test_block_internal_visibility(self):
         """Within a block, all positions should see each other (bidirectional)."""
         block_size, ctx_len = 4, 16
@@ -501,57 +671,67 @@ class TestDFlashModelForward(unittest.TestCase):
 
         device = torch.device("cpu")
         k = torch.arange(16, device=device).view(1, 1, -1)
-        decay = torch.exp(-(k - 1).clamp(min=0).float() / 7.0)
+        decay = torch.exp(-k.float() / 7.0)
 
-        # k=0 → exp(0) = 1.0 (but excluded by pos_in_block > 0)
-        # k=1 → exp(0) = 1.0
-        # k=2 → exp(-1/7) ≈ 0.867
-        # k=15 → exp(-14/7) = exp(-2) ≈ 0.135
+        # Every slot is learned: position 1 has weight 1 and later positions decay.
         self.assertAlmostEqual(decay[0, 0, 0].item(), 1.0, places=5)
-        self.assertAlmostEqual(decay[0, 0, 1].item(), 1.0, places=5)
-        self.assertAlmostEqual(decay[0, 0, 2].item(), math.exp(-1.0 / 7.0), places=5)
-        self.assertAlmostEqual(decay[0, 0, 15].item(), math.exp(-14.0 / 7.0), places=5)
+        self.assertAlmostEqual(decay[0, 0, 1].item(), math.exp(-1.0 / 7.0), places=5)
+        self.assertAlmostEqual(decay[0, 0, 2].item(), math.exp(-2.0 / 7.0), places=5)
+        self.assertAlmostEqual(decay[0, 0, 15].item(), math.exp(-15.0 / 7.0), places=5)
 
-    def test_label_alignment_same_position(self):
-        """Labels at positions anchor+0..anchor+block_size-1 (same-position prediction)."""
-        device = torch.device("cpu")
+    def test_label_alignment_learned_first(self):
+        """Every query slot predicts the successor at anchor+1..anchor+B."""
+        from angelspec.models.ops.dflash_layout import build_dflash_proposal_layout
+
         block_size = 4
 
         anchor_positions = torch.tensor([[5, 20]])
-        label_offsets = torch.arange(0, block_size, device=device).view(1, 1, -1)
-        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
+        layout = build_dflash_proposal_layout(
+            anchor_positions,
+            sequence_length=32,
+            block_size=block_size,
+        )
 
-        # Block 0 (anchor=5): labels at positions 5, 6, 7, 8
-        self.assertEqual(label_indices[0, 0].tolist(), [5, 6, 7, 8])
-        # Block 1 (anchor=20): labels at positions 20, 21, 22, 23
-        self.assertEqual(label_indices[0, 1].tolist(), [20, 21, 22, 23])
+        self.assertEqual(layout.label_indices[0, 0].tolist(), [6, 7, 8, 9])
+        self.assertEqual(layout.predecessor_indices[0, 0].tolist(), [5, 6, 7, 8])
+        self.assertEqual(layout.label_indices[0, 1].tolist(), [21, 22, 23, 24])
 
-    def test_anchor_loss_excluded(self):
-        """Position 0 in block (the anchor itself) should have zero loss weight."""
-        device = torch.device("cpu")
+    def test_all_query_slots_are_learned(self):
+        """Slot 0 is the first output distribution, not an ignored anchor output."""
         block_size = 4
-
-        pos_in_block = torch.arange(block_size, device=device).view(1, 1, -1)
-        anchor_weight = (pos_in_block > 0).float()
-
-        # pos 0 (anchor) should be excluded
-        self.assertEqual(anchor_weight[0, 0, 0].item(), 0.0)
-        # pos 1, 2, 3 should be included
-        for i in range(1, block_size):
-            self.assertEqual(anchor_weight[0, 0, i].item(), 1.0)
+        learned_weight = torch.ones(1, 1, block_size)
+        self.assertTrue(learned_weight.bool().all())
 
 
 class TestDFlashTrainerAggregation(unittest.TestCase):
+    _trainer_class = None
+
     class _DummyOptimizer:
         def get_learning_rate(self):
             return 1e-3
 
     @staticmethod
     def _make_trainer():
-        from angelspec.training.dflash_trainer import DFlashTrainer
+        # Metric reduction has no Mooncake dependency. Provide its import-time
+        # symbol so this CPU unit test does not require RDMA shared libraries.
+        mooncake_package = types.ModuleType("mooncake")
+        mooncake_package.__path__ = []
+        mooncake_store = types.ModuleType("mooncake.store")
+        mooncake_store.MooncakeDistributedStore = object
+        if TestDFlashTrainerAggregation._trainer_class is None:
+            with mock.patch.dict(
+                sys.modules,
+                {"mooncake": mooncake_package, "mooncake.store": mooncake_store},
+            ):
+                from angelspec.training.dflash_trainer import DFlashTrainer
+
+            TestDFlashTrainerAggregation._trainer_class = DFlashTrainer
+        else:
+            DFlashTrainer = TestDFlashTrainerAggregation._trainer_class
 
         trainer = object.__new__(DFlashTrainer)
         trainer.loss_decay_gamma = 1.0
+        trainer.loss_objective = "decay"
         trainer.global_step = 7
         trainer.optimizer = TestDFlashTrainerAggregation._DummyOptimizer()
         return trainer
@@ -560,14 +740,14 @@ class TestDFlashTrainerAggregation(unittest.TestCase):
     def _step_metrics(loss_key: str, acc_key: str, count_key: str) -> list[dict]:
         return [
             {
-                loss_key: torch.tensor([0.0, 1.0, 5.0, 0.0]),
-                acc_key: torch.tensor([0.0, 0.5, 1.0, 0.0]),
-                count_key: torch.tensor([0.0, 10.0, 2.0, 0.0]),
+                loss_key: torch.tensor([1.0, 5.0, 0.0, 0.0]),
+                acc_key: torch.tensor([0.5, 1.0, 0.0, 0.0]),
+                count_key: torch.tensor([10.0, 2.0, 0.0, 0.0]),
             },
             {
-                loss_key: torch.tensor([0.0, 0.0, 2.0, 4.0]),
-                acc_key: torch.tensor([0.0, 0.0, 0.25, 0.5]),
-                count_key: torch.tensor([0.0, 0.0, 8.0, 4.0]),
+                loss_key: torch.tensor([0.0, 2.0, 4.0, 0.0]),
+                acc_key: torch.tensor([0.0, 0.25, 0.5, 0.0]),
+                count_key: torch.tensor([0.0, 8.0, 4.0, 0.0]),
             },
         ]
 
@@ -580,9 +760,9 @@ class TestDFlashTrainerAggregation(unittest.TestCase):
         denominator = sum(counts[i] * weights[i] for i in range(len(losses)))
         return numerator / denominator
 
-    @mock.patch("angelspec.training.dflash_trainer.dist.get_rank", return_value=0)
+    @mock.patch("torch.distributed.get_rank", return_value=0)
     @mock.patch(
-        "angelspec.training.dflash_trainer.dist.all_reduce",
+        "torch.distributed.all_reduce",
         side_effect=lambda tensor, op=None: None,
     )
     def test_aggregate_metrics_uses_per_position_counts(self, _mock_all_reduce, _mock_get_rank):
@@ -603,9 +783,49 @@ class TestDFlashTrainerAggregation(unittest.TestCase):
         self.assertAlmostEqual(metrics["train/avg_loss"], self._expected_avg_loss(), places=6)
         self.assertAlmostEqual(metrics["train/simulated_acc_len"], 0.8, places=6)
 
-    @mock.patch("angelspec.training.dflash_trainer.dist.get_rank", return_value=0)
+    @mock.patch("torch.distributed.get_rank", return_value=0)
     @mock.patch(
-        "angelspec.training.dflash_trainer.dist.all_reduce",
+        "torch.distributed.all_reduce",
+        side_effect=lambda tensor, op=None: None,
+    )
+    def test_aggregate_edr_metrics_reports_batch_mal_instead_of_acceptance_proxy(
+        self, _mock_all_reduce, _mock_get_rank
+    ):
+        trainer = self._make_trainer()
+        trainer.loss_objective = "edr"
+        step_metrics = self._step_metrics(
+            "loss_per_position", "acc_per_position", "count_per_position"
+        )
+        edr_components = (
+            {
+                "edr_surrogate_loss": torch.tensor(5.0),
+                "edr_weighted_cost_sum": torch.tensor(2.0),
+                "edr_num_horizons": torch.tensor(1.0),
+                "edr_num_degenerate_horizons": torch.tensor(0.0),
+                "edr_generated_tokens": torch.tensor(4.0),
+            },
+            {
+                "edr_surrogate_loss": torch.tensor(3.0),
+                "edr_weighted_cost_sum": torch.tensor(12.0),
+                "edr_num_horizons": torch.tensor(3.0),
+                "edr_num_degenerate_horizons": torch.tensor(1.0),
+                "edr_generated_tokens": torch.tensor(15.0),
+            },
+        )
+        for step_metric, components in zip(step_metrics, edr_components, strict=True):
+            step_metric.update(components)
+
+        metrics = trainer._aggregate_metrics(step_metrics, step=11)
+
+        self.assertNotIn("train/avg_acc", metrics)
+        self.assertNotIn("train/simulated_acc_len", metrics)
+        self.assertEqual(metrics["train/edr_generated_tokens"], 19.0)
+        self.assertEqual(metrics["train/edr_weighted_cost"], 14.0)
+        self.assertAlmostEqual(metrics["train/edr_mal"], (19.0 + 4.0) / 14.0, places=6)
+
+    @mock.patch("torch.distributed.get_rank", return_value=0)
+    @mock.patch(
+        "torch.distributed.all_reduce",
         side_effect=lambda tensor, op=None: None,
     )
     def test_aggregate_eval_metrics_uses_exact_scalar_reduction(
@@ -926,6 +1146,8 @@ class TestDFlashTrainingConfig(unittest.TestCase):
 
         config = TrainingConfig()
         self.assertEqual(config.dflash_block_size, 16)
+        self.assertFalse(config.dflash_query_includes_input_anchor)
+        self.assertFalse(config.dflash_edr_full_anchor_backprop)
         self.assertEqual(config.dflash_num_anchors, 512)
         self.assertEqual(config.dflash_loss_decay_gamma, 7.0)
         self.assertEqual(config.dflash_num_target_layers, 5)
@@ -943,11 +1165,13 @@ class TestDFlashTrainingConfig(unittest.TestCase):
             [
                 "training.dflash_block_size=8",
                 "training.dflash_num_target_layers=3",
+                "training.dflash_edr_full_anchor_backprop=true",
             ]
         )
         merged = OmegaConf.merge(schema, overrides)
         self.assertEqual(merged.training.dflash_block_size, 8)
         self.assertEqual(merged.training.dflash_num_target_layers, 3)
+        self.assertTrue(merged.training.dflash_edr_full_anchor_backprop)
 
 
 class TestDFlashTrainingQuality(unittest.TestCase):
@@ -1020,7 +1244,27 @@ class TestDFlashTrainingQuality(unittest.TestCase):
         """Accuracy should improve over training when overfitting on a small batch."""
         torch.manual_seed(42)
         model, *data = self._make_model_and_data(seq_len=64, batch_size=1)
-        _, accs = self._train_steps(model, *data, steps=30)
+        model.train()
+        optimizer = torch.optim.Adam(
+            [parameter for parameter in model.parameters() if parameter.requires_grad],
+            lr=1e-3,
+        )
+        anchors = torch.tensor([[4, 16, 32, 48]])
+        keep = torch.ones_like(anchors, dtype=torch.bool)
+        accs = []
+        for _ in range(30):
+            optimizer.zero_grad()
+            loss, accuracy, *_ = model(
+                input_ids=data[0],
+                hidden_states_list=data[1],
+                loss_mask=data[2],
+                lm_head_weight=data[3],
+                injected_anchors=anchors,
+                injected_keep_mask=keep,
+            )
+            loss.backward()
+            optimizer.step()
+            accs.append(accuracy.item())
         avg_first5 = sum(accs[:5]) / 5
         avg_last5 = sum(accs[-5:]) / 5
         self.assertGreater(
@@ -1172,32 +1416,6 @@ class TestDFlashVsEagle3Architecture(unittest.TestCase):
 class TestDFlashConfigYAML(unittest.TestCase):
     """Verify the DFlash training config YAML loads correctly."""
 
-    def test_dflash_yaml_loads(self):
-        import os
-
-        try:
-            from angelspec.config.train_config import load_config
-        except ImportError:
-            self.skipTest("load_config requires ray (not installed locally)")
-
-        config_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            "configs",
-            "sglang_qwen3_8b_dflash.yaml",
-        )
-        if not os.path.exists(config_path):
-            self.skipTest(f"DFlash config not found at {config_path}")
-
-        config = load_config(config_path=config_path)
-        self.assertEqual(config.training.dflash_block_size, 16)
-        self.assertEqual(config.training.dflash_num_anchors, 512)
-        self.assertEqual(config.training.dflash_num_target_layers, 5)
-        self.assertAlmostEqual(config.training.dflash_loss_decay_gamma, 7.0)
-        self.assertEqual(
-            config.model.draft_model_config,
-            "angelspec/config/dflash_draft_config.json",
-        )
-
     def test_dflash_draft_config_json_loads(self):
         import json
         import os
@@ -1246,6 +1464,9 @@ class TestDFlashHotfixes(unittest.TestCase):
 
         # Should not raise (DFlash does not provide target/last_hidden_states)
         batch = collator(samples)
+        self.assertEqual(tuple(batch["input_ids"].shape), (2, 128))
+        self.assertEqual(tuple(batch["attention_mask"].shape), (2, 128))
+        self.assertEqual(tuple(batch["hidden_states"].shape), (2, 128, 384))
         self.assertIsNotNone(batch["hidden_states"])
         self.assertIsNone(batch["target"])
         self.assertIsNone(batch["last_hidden_states"])

@@ -1,67 +1,54 @@
 <div align="center">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/_static/logo_banner_white.png">
-  <source media="(prefers-color-scheme: light)" srcset="docs/_static/logo_banner.png">
-  <img src="docs/_static/logo_banner.png" alt="AngelSpec" width="420">
-</picture>
-
-**A unified training framework for MTP and block-parallel speculative decoding**
-
-[![arXiv](https://img.shields.io/badge/arXiv-2607.25852-b31b1b.svg)](https://arxiv.org/abs/2607.25852)
-[![Documentation](https://img.shields.io/badge/docs-readthedocs-blue.svg)](https://angelspec.readthedocs.io)
-[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-yellow)](https://huggingface.co/collections/AngelSlim/angelspec)
-[![License](https://img.shields.io/badge/License-AngelSpec%20License-green.svg)](LICENSE)
+# Training Parallel Speculative Draft Models by Directly Minimizing Expected Decoding Rounds
 
 </div>
 
-AngelSpec is developed by the Tencent Hunyuan AI Infra team, which is a torch-native framework for training speculative-decoding draft models, covering both autoregressive MTP drafting and the block-parallel DFlash family. It is the training framework behind the [technical report](https://arxiv.org/abs/2607.25852): all drafters in the report — the TTT-trained MTP drafter and the DFly family — are trained and released with it.
-
-## Latest News
-
-- **[2026/07/29]** We release AngelSpec v0.1.0, supporting MTP and block-parallel speculative decoding training. Check out our [technical report](https://arxiv.org/abs/2607.25852) and [released models](https://huggingface.co/collections/AngelSlim/angelspec).
+This repository contains the code for the paper *Training Parallel Speculative Draft Models by
+Directly Minimizing Expected Decoding Rounds*. It is a fork of Tencent's
+[AngelSpec](https://github.com/Tencent/angelspec) (upstream commit `d3412be`), a torch-native
+framework for training speculative-decoding draft models. The fork adds a new training objective,
+**Expected Decoding Rounds (EDR)**, and an exact offline evaluator for parallel and
+semi-autoregressive drafters. Every other AngelSpec component keeps its upstream structure and
+behavior; see the [AngelSpec documentation](https://angelspec.readthedocs.io) for the
+architectures, objectives and distributed training features inherited from upstream.
 
 ## Key Features
 
-- **6 draft architectures** — DFly, DFlash, DFlare, Eagle3, DSpark, MTP — behind one training pipeline; switching is a config change
-- **MTP training with TTT** — on-policy multi-depth rollout with memory close to a single causal pass; long-context training up to 128k via Ulysses sequence parallelism
-- **Acceptance-aligned objectives** — CE, top-k KL, LK losses, D-PACE weighting, and end-to-end TV, composable through configuration
-- **Document-aware sequence packing** — Megatron-style fixed-length packing with strict cross-document isolation, on both the DFlash and MTP paths
-- **Online evaluation** — genuine speculative decoding against the latest checkpoint during training, reporting mean accepted length and per-position acceptance as measured by the serving engine
-
-## Architecture
-
-<p align="center">
-  <img src="docs/_static/framework.png" alt="AngelSpec Framework" width="800">
-</p>
-
-Inference and training run as separate GPU worker groups connected by a [Mooncake](https://github.com/kvcache-ai/Mooncake) tensor store, so hidden-state generation and optimization scale independently. This disaggregated foundation comes from [TorchSpec](https://github.com/lightseekorg/TorchSpec); AngelSpec extends it with the architectures, objectives, and training features above.
-
-## Draft Architectures
-
-| Architecture | Method | Key Idea |
-|-------------|--------|----------|
-| **DFly** | Block-parallel | Hybrid target conditioning + hidden-correction AR head |
-| **DFlash** | Block-parallel | Anchor sampling + parallel block generation |
-| **DFlare** | Block-parallel | DFlash + learnable per-layer target fusion |
-| **Eagle3** | Autoregressive TTT | Test-time training with input fusion |
-| **DSpark** | Hybrid | DFlash backbone + EAGLE-style autoregressive head |
-| **MTP** | Single-head TTT | Full MoE decoder layer as draft (Hy3-native) |
-
-See the [draft-model family](https://angelspec.readthedocs.io/en/latest/concepts/draft_model_family.html) docs for details and trade-offs.
+- **EDR training.** EDR models speculative decoding, conditioned on the target output, as a
+  Markov reward process. The objective weights EOS-aware local rejection costs by exact state
+  occupancies and equals the expected number of decoding rounds (Theorem 1). Training uses the
+  temporal-difference gradient of Theorem 2: occupancies and value functions come from exact
+  forward and backward dynamic programs without gradients, and gradients flow only through the
+  local costs and acceptance probabilities (Algorithm 1). Each rollout trains on at most 512
+  anchors, selected by capped-proportional systematic sampling with inverse-probability weights
+  so the stochastic gradient stays unbiased (Appendix C.2). EDR has no extra hyperparameters and
+  applies to the paper's DSpark and DFly drafters without changing their
+  architecture or inference procedure.
+- **Offline evaluator.** It estimates the mean accepted length (MAL) exactly from target-model
+  rollouts alone, without running speculative decoding (Section 3.4). Target trajectories are
+  sampled once per benchmark and cached, so every checkpoint is scored on the same rollouts. This
+  gives paired comparisons between drafters and training objectives. The bundled prompt sets
+  match the nine DSpark/DeepSpec evaluation benchmarks.
 
 ## Quick Start
+
+The fork adds no Python packages to AngelSpec's dependencies, so the upstream installation steps
+apply unchanged:
 
 ```bash
 # Install AngelSpec + the vLLM backend
 pip install -e ".[vllm]"
 pip install mooncake-transfer-engine
 
-# Single-node quickstart (8 GPUs: 4 inference + 4 training)
-./examples/qwen3-8b-dfly/run.sh
+# 1. Sample the target rollouts from the training config (same sampling configuration)
+./examples/generate_training_data/run.sh --training-config configs/vllm_qwen3_8b_dfly_edr.yaml
+
+# 2. EDR finetuning of the released Qwen3-8B DFly draft (one GPU)
+./examples/qwen3-8b-dfly-cpt-edr/run.sh
 
 # Override config values from CLI
-./examples/qwen3-8b-dfly/run.sh training.learning_rate=5e-5 training.num_train_steps=500
+./examples/qwen3-8b-dfly-cpt-edr/run.sh training.num_train_steps=500
 ```
 
 Or set up a conda environment (installs mooncake too):
@@ -71,92 +58,95 @@ Or set up a conda environment (installs mooncake too):
 micromamba activate angelspec
 ```
 
+The single-GPU recipes use vLLM only to regenerate training trajectories and for offline
+evaluation; training itself does not start vLLM, Ray or Mooncake. On H200 and B200, the
+FlexAttention `FLASH` backend also needs the upstream `fa` extra (`pip install -e ".[fa]"`).
+**Sample the target rollouts first, with exactly the same sampling configuration as training,
+then train.** Every recipe trains on target-model responses.
+[generate_training_data](examples/generate_training_data/) reads the target model and sampling
+configuration (temperature, top-p, top-k) from the training config's `model.target_model_path`
+and `dataset.target_sampling`, so generate and train with the same config; training rejects
+caches sampled with a different target model or sampling configuration. Download the target and draft checkpoints
+as described in each example's README.
+
 > **CUDA 12.x hosts:** PyPI's default `torch` / `vllm` wheels target CUDA 13 and won't load on a CUDA-12 driver. Install CUDA-matched wheels first — see [Installation](https://angelspec.readthedocs.io/en/latest/get_started/installation.html).
 
 ## Examples
 
 <details open>
-<summary><b>Multi-node (Hy3 target)</b></summary>
+<summary><b>EDR training (single GPU)</b></summary>
 
-| Example | Architecture | Mode | Released Model |
-|---------|-------------|------|----------------|
-| [hy3-dfly](examples/hy3-dfly/) | DFly | From scratch | [AngelSlim/Hy3-DFly-Block8](https://huggingface.co/AngelSlim/Hy3-DFly-Block8) |
-| [hy3-mtp](examples/hy3-mtp/) | MTP | From scratch | [AngelSlim/Hy3-MTP-TTT3](https://huggingface.co/AngelSlim/Hy3-MTP-TTT3) |
+All recipes finetune a publicly released drafter on Open-PerfectBlend prompts, with responses
+regenerated by the target model. Training from scratch is not supported. Each recipe pairs EDR
+with the end-to-end multi-step TV (E2E) baseline on the same data, optimizer and number of steps.
+
+| Example | Architecture | Target | Objective | Mode | Initialization |
+|---------|-------------|--------|-----------|------|----------------|
+| [qwen3-4b-dspark-edr](examples/qwen3-4b-dspark-edr/) | DSpark | Qwen3-4B | EDR | Finetuning | [deepseek-ai/dspark_qwen3_4b_block7](https://huggingface.co/deepseek-ai/dspark_qwen3_4b_block7) |
+| [qwen3-4b-dspark-e2e](examples/qwen3-4b-dspark-e2e/) | DSpark | Qwen3-4B | E2E | Finetuning | [deepseek-ai/dspark_qwen3_4b_block7](https://huggingface.co/deepseek-ai/dspark_qwen3_4b_block7) |
+| [qwen3-8b-dfly-cpt-edr](examples/qwen3-8b-dfly-cpt-edr/) | DFly | Qwen3-8B | EDR | Finetuning | [AngelSlim/Qwen3-8B-DFly-Block8](https://huggingface.co/AngelSlim/Qwen3-8B-DFly-Block8) |
+| [qwen3-8b-dfly-cpt-e2e](examples/qwen3-8b-dfly-cpt-e2e/) | DFly | Qwen3-8B | E2E | Finetuning | [AngelSlim/Qwen3-8B-DFly-Block8](https://huggingface.co/AngelSlim/Qwen3-8B-DFly-Block8) |
+
+Training data for every recipe come from
+[generate_training_data](examples/generate_training_data/), which takes a training config and
+samples target rollouts for every epoch it lists (or one epoch with `--epoch`), using the
+config's target model and sampling configuration (`T`, top-p, top-k). The DSpark checkpoint import and the hardware presets shared by both DSpark
+recipes are described in [qwen3-4b-dspark-edr](examples/qwen3-4b-dspark-edr/).
+
+The paper's experiments run on a single GPU, and only the single-GPU EDR path
+(`angelspec.train_single_gpu`) has been partly optimized. EDR can also run through AngelSpec's
+multi-GPU pipeline, but that path is not tuned for EDR: the per-rollout dynamic programs and
+anchor sampling make the work per sample vary with trajectory length, so multi-GPU runs may show
+workload imbalance across ranks or other performance problems.
 
 </details>
 
-<details>
-<summary><b>Single-node (Qwen3-8B target)</b></summary>
+<details open>
+<summary><b>Offline evaluator</b></summary>
 
-| Example | Architecture | Mode | Released Model |
-|---------|-------------|------|----------------|
-| [qwen3-8b-dspark](examples/qwen3-8b-dspark/) | DSpark | From scratch | — |
-| [qwen3-8b-dfly](examples/qwen3-8b-dfly/) | DFly | From scratch | [AngelSlim/Qwen3-8B-DFly-Block8](https://huggingface.co/AngelSlim/Qwen3-8B-DFly-Block8) |
-| [qwen3-8b-mtp](examples/qwen3-8b-mtp/) | MTP | From scratch | [AngelSlim/Qwen3-8B-MTP-TTT3](https://huggingface.co/AngelSlim/Qwen3-8B-MTP-TTT3) |
-| [qwen3-8b-dfly-cpt](examples/qwen3-8b-dfly-cpt/) | DFly | CPT (from ckpt) | Continue from AngelSlim/Qwen3-8B-DFly-Block8 |
+[examples/eval](examples/eval/) caches target trajectories with vLLM and scores draft checkpoints
+with the exact dynamic program on one GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash examples/eval/eval_dp.sh \
+  ./outputs/qwen3-8b-dfly-cpt-edr/checkpoints \
+  --target-model ./target_models/Qwen3-8B \
+  --draft-config angelspec/config/dfly_qwen3_8b_draft_config.json \
+  --temperature 1 --top-p 1 --top-k -1 \
+  --output-root ./eval_outputs/qwen3-8b-dfly-edr
+```
+
+The target model, draft config and target sampling configuration (`--temperature`, `--top-p`,
+`--top-k`) are required. The sampling configuration must be consistent with the offline target
+rollouts: it defines how the cached rollouts are sampled and the target distribution the DP
+scores against, so use the same configuration for every checkpoint compared on those rollouts
+(for the paper recipes, the config's `dataset.target_sampling`).
+
+Each rollout must end with the target's EOS token (`<|im_end|>` for Qwen3), which is the last
+sampled token counted in MAL. The `"\n"` that the chat template appends after `<|im_end|>` is not
+part of the rollout and is never scored.
 
 </details>
 
 <details>
 <summary><b>Available training configs</b></summary>
 
-| Config | Architecture | Features |
-|--------|-------------|----------|
-| `configs/vllm_qwen3_8b_dfly.yaml` | DFly | Block-parallel + hidden correction |
-| `configs/vllm_qwen3_8b_dflare.yaml` | DFlare | Per-layer target fusion |
-| `configs/sglang_qwen3_8b_dflash.yaml` | DFlash | SGLang backend |
-| `configs/sglang_qwen3_8b_dspark.yaml` | DSpark | Markov head + confidence |
-| `configs/vllm_qwen3_8b_mtp_pack_usp_40k.yaml` | MTP | Packing + USP 40k seq |
+| Config | Drafter | Objective |
+|--------|---------|-----------|
+| `configs/vllm_qwen3_4b_dspark_edr.yaml` | DSpark (Qwen3-4B) | EDR |
+| `configs/vllm_qwen3_4b_dspark_e2e.yaml` | DSpark (Qwen3-4B) | E2E multi-step TV |
+| `configs/vllm_qwen3_8b_dfly_edr.yaml` | DFly Block8 (Qwen3-8B) | EDR |
+| `configs/vllm_qwen3_8b_dfly_e2e.yaml` | DFly Block8 (Qwen3-8B) | E2E multi-step TV |
 
 </details>
 
-## Released Models
-
-Draft models trained with AngelSpec:
-
-| Model | Architecture | Target | Mode |
-|-------|-------------|--------|------|
-| [AngelSlim/Hy3-DFly-Block8](https://huggingface.co/AngelSlim/Hy3-DFly-Block8) | DFly | Hy3 | No-think |
-| [AngelSlim/Hy3-DFly-Block8-Think-High](https://huggingface.co/AngelSlim/Hy3-DFly-Block8-Think-High) | DFly | Hy3 | High-think |
-| [AngelSlim/Hy3-MTP-TTT3](https://huggingface.co/AngelSlim/Hy3-MTP-TTT3) | MTP | Hy3 | No-think |
-| [AngelSlim/Qwen3-8B-DFly-Block8](https://huggingface.co/AngelSlim/Qwen3-8B-DFly-Block8) | DFly | Qwen3-8B | No-think |
-| [AngelSlim/Qwen3-8B-MTP-TTT3](https://huggingface.co/AngelSlim/Qwen3-8B-MTP-TTT3) | MTP | Qwen3-8B | No-think |
-
-## Benchmark
-
-### Offline Throughput (HY3-295B-A21B, TP=8)
-
-<p align="center">
-  <img src="docs/_static/main_result.png" alt="Main throughput results" width="800">
-</p>
-
-Output-token throughput (Tok/s) and speedup relative to AR at temperature 1 across concurrency levels. Each cell uses 3 × 120 s windows; Avg. is the arithmetic mean across six datasets.
-
-### Live Traffic Throughput (D-cut)
-
-<p align="center">
-  <img src="docs/_static/live_throughput.png" alt="Live traffic throughput" width="800">
-</p>
-
-D-cut on Hy3 live traffic (Hy3-295B-A21B, TP=8, 8× H20; concurrency 2–64). **(a)** Aggregate throughput vs. per-user decode speed — points up and to the right are better. **(b)** Aggregate throughput vs. concurrency — DFly saturates beyond concurrency 48, whereas D-cut continues to convert additional load into throughput.
-
 ## License
 
-This project is released under [LICENSE](LICENSE). AngelSpec is built upon [TorchSpec](https://github.com/lightseekorg/TorchSpec) by LightSeek Foundation and uses [Mooncake](https://github.com/kvcache-ai/Mooncake) for disaggregated hidden-state transfer.
+The AngelSpec code in this repository, including our modifications to existing AngelSpec files,
+follows the original AngelSpec license in [LICENSE](LICENSE). AngelSpec is built upon
+[TorchSpec](https://github.com/lightseekorg/TorchSpec) by LightSeek Foundation and uses
+[Mooncake](https://github.com/kvcache-ai/Mooncake) for disaggregated hidden-state transfer.
 
-## Citation
-
-If you find AngelSpec useful, please cite:
-
-```bibtex
-@article{angelspec2026,
-  title   = {AngelSpec: Towards Real-World High Performance Inference with Speculative Decoding},
-  author  = {Liu, Hong and Cen, Rui and Shi, Junhan and Qin, Guangshuo and Zhang, Jiebin and Liu, Tianyu and Fan, Runzhi and Zhao, Guoliang and Xie, Ruobing and Zhang, Kai and Liu, Song and Yu, Guanghua and Zhu, Jianchen},
-  journal = {arXiv preprint arXiv:2607.25852},
-  year    = {2026}
-}
-```
-
-## Projects in teams
-
-- [AngelSlim](https://github.com/Tencent/AngelSlim): A more accessible, comprehensive, and efficient toolkit for large model compression.
+New files added by this fork are released under the MIT License. The evaluation prompts in
+`angelspec/data/eval_prompts/` are derived from DeepSpec and the original benchmarks and keep
+their original terms; see [DeepSpec-NOTICE.md](angelspec/data/eval_prompts/DeepSpec-NOTICE.md).

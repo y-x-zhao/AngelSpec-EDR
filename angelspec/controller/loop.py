@@ -21,11 +21,9 @@
 """Pipeline training loop: main training loop with sync training and async inference."""
 
 import os
-import re
 import shutil
 import tempfile
 import time
-from pathlib import Path
 
 import ray
 import wandb
@@ -43,6 +41,8 @@ from angelspec.controller.online_eval import (
     maybe_run_online_eval,
     setup_online_eval,
 )
+from angelspec.training.schedule import epoch_cursor
+from angelspec.utils.checkpoint_policy import _cleanup_old_checkpoints, _is_save_interval_step
 from angelspec.utils.logging import get_tb_writer, logger
 
 
@@ -78,42 +78,6 @@ def _maybe_sync_draft_weights(args, completed_steps, train_group, inference_engi
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.info(f"Cleaned up temp dir {tmp_dir}")
-
-
-def _is_save_interval_step(step: int, interval: int) -> bool:
-    return interval > 0 and step % interval == 0
-
-
-def _cleanup_old_checkpoints(checkpoint_dir: str | None, max_checkpoints: int) -> None:
-    """Delete old checkpoints, keeping only the most recent `max_checkpoints`.
-
-    Checkpoint directories are named ``iter_NNNNNNN`` where N is the step number.
-    The ``latest_checkpointed_iteration.txt`` and ``best_*`` files are preserved.
-    """
-    if not checkpoint_dir or max_checkpoints <= 0:
-        return
-
-    base_dir = Path(checkpoint_dir).expanduser()
-    if not base_dir.exists():
-        return
-
-    # Find all iter_* directories, sorted by step number
-    iter_dirs = sorted(
-        (d for d in base_dir.iterdir() if d.is_dir() and re.match(r"iter_\d+", d.name)),
-        key=lambda d: int(re.search(r"\d+", d.name).group()),
-    )
-
-    if len(iter_dirs) <= max_checkpoints:
-        return
-
-    # Delete oldest checkpoints, keep the newest max_checkpoints
-    to_delete = iter_dirs[: len(iter_dirs) - max_checkpoints]
-    for old_dir in to_delete:
-        logger.info(f"Removing old checkpoint: {old_dir}")
-        try:
-            shutil.rmtree(old_dir)
-        except OSError as e:
-            logger.warning(f"Failed to remove old checkpoint {old_dir}: {e}")
 
 
 def _safe_training_cleanup(
@@ -226,9 +190,13 @@ def training_loop(
     # Resume is best-effort: completed optimizer steps determine epoch/skip, but
     # async prompt/result buffers can still lose or replay a small tail.
     start_step = ray.get(train_group._actor_handlers[0].get_global_step.remote())
-    resume_epoch = start_step // steps_per_epoch if steps_per_epoch > 0 else 0
-    resume_skip = (start_step % steps_per_epoch) * args.global_batch_size if start_step > 0 else 0
-    ray.get(controller.submit_training_dataset.remote(epoch=resume_epoch, skip=resume_skip))
+    # Fallback when auto_calculate_training_steps has not set steps_per_epoch.
+    if not hasattr(args, "steps_per_epoch"):
+        args.steps_per_epoch = steps_per_epoch
+    resume_epoch, resume_epoch_step, steps_per_epoch = epoch_cursor(args, start_step)
+    resume_skip = resume_epoch_step * args.global_batch_size
+    if start_step < num_steps:
+        ray.get(controller.submit_training_dataset.remote(epoch=resume_epoch, skip=resume_skip))
 
     logger.info(
         f"Starting: num_steps={num_steps}, num_epochs={num_epochs}, "
@@ -240,8 +208,8 @@ def training_loop(
     enable_perf = getattr(args, "enable_perf_metrics", True)
 
     completed_steps = start_step
-    current_epoch = completed_steps // steps_per_epoch + 1
-    steps_in_current_epoch = completed_steps % steps_per_epoch
+    current_epoch = resume_epoch + 1
+    steps_in_current_epoch = resume_epoch_step
     if start_step > 0:
         logger.info(f"Resuming from step {start_step} (epoch {current_epoch})")
     dispatch_attempts = 0
@@ -286,6 +254,10 @@ def training_loop(
                     and status is not None
                     and status["sample_pool_size"] < status["dispatch_batch_size"]
                     and status.get("prompt_buffer_size", 0) == 0
+                    and (
+                        getattr(args, "epoch_step_boundaries", None) is None
+                        or status["epoch_returned_samples"] == status["epoch_submitted_samples"]
+                    )
                 ):
                     logger.warning(
                         f"Pool insufficient for dispatch "
@@ -298,6 +270,12 @@ def training_loop(
                     should_reload = True
 
                 if should_reload:
+                    if getattr(args, "epoch_step_boundaries", None) is not None:
+                        raise RuntimeError(
+                            "Epoch cache exhausted before its planned optimizer boundary; "
+                            "refusing to mix epochs or skip unconsumed rows. Check inference failures "
+                            "and cached_samples metadata."
+                        )
                     if completed_steps < num_steps:
                         current_epoch += 1
                         steps_in_current_epoch = 0
@@ -389,10 +367,23 @@ def training_loop(
             status = ray.get(controller.get_full_status.remote())
             postfix = {
                 "loss": f"{metrics.get('train/avg_loss', 0):.3f}",
-                "acc": f"{metrics.get('train/avg_acc', 0):.3f}",
-                "acc_len": f"{metrics.get('train/simulated_acc_len', 0):.2f}",
                 "thru": f"{status['inference_speed']:.1f}",
             }
+            if "train/edr_mal" in metrics:
+                postfix.update(
+                    {
+                        "tokens": f"{metrics['train/edr_generated_tokens']:.0f}",
+                        "cost": f"{metrics['train/edr_weighted_cost']:.2f}",
+                        "MAL": f"{metrics['train/edr_mal']:.3f}",
+                    }
+                )
+            else:
+                postfix.update(
+                    {
+                        "acc": f"{metrics.get('train/avg_acc', 0):.3f}",
+                        "acc_len": f"{metrics.get('train/simulated_acc_len', 0):.2f}",
+                    }
+                )
             if enable_perf:
                 postfix["I"] = f"{metrics.get('perf/infer_capacity', 0):.1f}"
                 postfix["T"] = f"{metrics.get('perf/train_capacity', 0):.1f}"
@@ -445,6 +436,10 @@ def training_loop(
                 if completed_steps < num_steps:
                     current_epoch += 1
                     steps_in_current_epoch = 0
+                    if getattr(args, "epoch_step_boundaries", None) is not None:
+                        next_epoch, offset, steps_per_epoch = epoch_cursor(args, completed_steps)
+                        if next_epoch != current_epoch - 1 or offset != 0:
+                            raise RuntimeError("Inconsistent epoch-cache optimizer boundary")
                     logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
                     ray.get(controller.reload_dataset.remote())
                 else:

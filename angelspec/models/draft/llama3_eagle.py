@@ -130,7 +130,12 @@ try:
     _has_cute_dsl = True
 
     def _patch_cutlass_compilation() -> None:
-        """Two patches to reduce flash_attn cute DSL compilation overhead.
+        """Patches to reduce flash_attn cute DSL compilation overhead.
+
+        The patches apply only to FA4 < 4.0.0b30 (or an unknown FA4 version).
+        FA4 >= 4.0.0b30 uses its native compilation, because an uncached compile
+        there may have module_hash=None and forcing caching after IR generation
+        would violate compile_and_cache's hash requirement.
 
         Patch 1 — Disk cache (BaseDSL.compile_and_cache):
             flash_attn hardcodes no_cache=True, bypassing CUTE_DSL_CACHE_DIR.
@@ -157,6 +162,32 @@ try:
                 export ANGELSPEC_FLASH_ATTN_PTXAS_OPT=1
         """
         import os
+        from importlib.metadata import PackageNotFoundError, version
+
+        from packaging.version import InvalidVersion, Version
+
+        try:
+            fa4_version = version("flash-attn-4")
+        except PackageNotFoundError:
+            logger.warning(
+                "flash-attn-4 version metadata unavailable; retaining legacy CuTe compilation patches"
+            )
+        else:
+            try:
+                use_native_compilation = Version(fa4_version) >= Version("4.0.0b30")
+            except InvalidVersion:
+                logger.warning(
+                    "Unrecognized flash-attn-4 version %r; retaining legacy CuTe compilation patches",
+                    fa4_version,
+                )
+            else:
+                if use_native_compilation:
+                    logger.info(
+                        "FlashAttention %s: using native CuTe compilation; AngelSpec disk-cache "
+                        "and opt-level patches disabled",
+                        fa4_version,
+                    )
+                    return
 
         # ── Patch 1: disk cache ───────────────────────────────────────────────
         try:

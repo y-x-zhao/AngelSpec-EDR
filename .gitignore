@@ -82,6 +82,11 @@ Thumbs.db
 *.log
 cache/
 outputs/
+target_models/
+draft_checkpoints/
+dataset/
+results/
+eval_outputs/
 running_logs/
 .cursor/
 _sglang/

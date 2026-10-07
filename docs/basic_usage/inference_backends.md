@@ -19,9 +19,8 @@ avoiding RPC serialization overhead. Hidden-state extraction is enabled through 
 speculative-config interface (`method="extract_hidden_states"`), and the captured tensors are
 written to the Mooncake store by a KV connector.
 
-```bash
-./examples/qwen3-8b-dfly/run.sh
-```
+The paper recipes train on one GPU with the HuggingFace backend; they use vLLM only offline,
+to regenerate target responses (`tools/regenerate_perfectblend.py`).
 
 Models that vLLM does not ship with are registered at runtime, so no manual patching of the vLLM
 installation is required.
@@ -29,19 +28,17 @@ installation is required.
 ## SGLang
 
 SGLang serves the target model with async inference. AngelSpec applies a patch to enable
-hidden-state extraction:
-
-```bash
-./examples/qwen3-8b-dspark/run.sh
-```
+hidden-state extraction. Select it with `model.target_model_backend=sglang` and an
+`inference.sglang` section in your config.
 
 ## HuggingFace
 
 The HuggingFace backend runs the target model with Transformers directly. It has the fewest
-dependencies and is useful for debugging or small setups:
+dependencies and is useful for debugging or small setups. The single-GPU recipes
+(`angelspec.train_single_gpu`) always use it:
 
 ```bash
-python3 -m angelspec.train_entry --config configs/hf_qwen3_8b.yaml
+CUDA_VISIBLE_DEVICES=0 ./examples/qwen3-8b-dfly-cpt-edr/run.sh
 ```
 
 ## Choosing a backend

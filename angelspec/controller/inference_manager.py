@@ -510,14 +510,39 @@ class AsyncInferenceManager:
     async def _forward_results(self, results: list[tuple[InferenceInput, Any | Exception]]) -> int:
         """Parse results and forward to controller. Returns success count."""
         inference_results = []
+        strict_epoch_cache = bool(getattr(self.args, "epoch_cache_dirs", None))
 
         for entry, result in results:
-            if isinstance(result, Exception):
-                continue
+            if not isinstance(result, Exception):
+                try:
+                    if strict_epoch_cache and isinstance(result, dict) and not (
+                        isinstance(result.get("mooncake_key"), str) and result["mooncake_key"]
+                    ):
+                        raise ValueError("Engine output has no nonempty Mooncake key")
+                    inference_result = self._parse_engine_output(entry, result)
+                except Exception as exc:
+                    if not strict_epoch_cache:
+                        raise
+                    result = exc
+                else:
+                    if inference_result is not None:
+                        inference_results.append(inference_result)
+                        continue
 
-            inference_result = self._parse_engine_output(entry, result)
-            if inference_result is not None:
-                inference_results.append(inference_result)
+            if strict_epoch_cache:
+                # Every submitted row is needed to complete this cache's exact
+                # optimizer-step budget; a dropped row would leave the epoch
+                # waiting for returned == submitted.
+                error = result if isinstance(result, Exception) else ValueError(
+                    f"Invalid engine output type: {type(result).__name__}"
+                )
+                message = (
+                    f"Epoch-cache inference failed for data_id={entry.data_id}: "
+                    f"{type(error).__name__}: {error}; refusing to drop a required epoch row"
+                )
+                self._running = False
+                await self.controller.set_inference_error.remote(message)
+                raise RuntimeError(message) from error
 
         if inference_results:
             await self.controller.push_inference_results.remote(inference_results)

@@ -18,10 +18,552 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import math
 import os
 
 import torch
 import torch.nn.functional as F
+
+from angelspec.models.ops.distill_sparse import sparse_tv_kl_per_pos
+from angelspec.models.ops.distill_target import prepare_distill_sparse_target
+from angelspec.models.ops.edr import _streaming_log_normalizers, prepare_edr_target_distribution
+from angelspec.utils.sampling import validate_sampling_parameters
+
+
+def _student_statistics_tile(
+    logits_chunk: torch.Tensor,
+    logit_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    logits_fp32 = logits_chunk.float() * logit_scale
+    max_values, max_indices = logits_fp32.max(dim=-1)
+    return torch.logsumexp(logits_fp32, dim=-1), max_values, max_indices
+
+
+_compiled_student_statistics_tile = torch.compile(
+    _student_statistics_tile,
+    dynamic=True,
+    fullgraph=True,
+)
+
+
+@torch.no_grad()
+def streaming_student_log_normalizers_and_argmax(
+    logits: torch.Tensor,
+    vocab_chunk_size: int,
+    logit_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute logZ(logits * scale) and argmax in one tiled FP32 vocabulary pass."""
+    if logits.ndim != 2 or logits.shape[-1] < 1:
+        raise ValueError("student logits must have shape [rows, non-empty vocabulary]")
+    if vocab_chunk_size < 1:
+        raise ValueError(f"vocab_chunk_size must be >= 1, got {vocab_chunk_size}")
+    if not math.isfinite(logit_scale) or logit_scale <= 0:
+        raise ValueError("student logit_scale must be finite and positive")
+
+    log_normalizers = None
+    max_values = None
+    max_indices = None
+    use_compiled = _use_compiled_streaming_loss(logits)
+    kernel = _compiled_student_statistics_tile if use_compiled else _student_statistics_tile
+    for chunk_start in range(0, logits.shape[-1], vocab_chunk_size):
+        chunk = logits[:, chunk_start : chunk_start + vocab_chunk_size]
+        chunk_log_normalizers, chunk_max_values, chunk_max_indices = kernel(chunk, logit_scale)
+        chunk_max_indices = chunk_max_indices + chunk_start
+        if log_normalizers is None:
+            log_normalizers = chunk_log_normalizers
+            max_values = chunk_max_values
+            max_indices = chunk_max_indices
+            continue
+        log_normalizers = torch.logaddexp(log_normalizers, chunk_log_normalizers)
+        assert max_values is not None and max_indices is not None
+        replace = chunk_max_values > max_values
+        max_values = torch.where(replace, chunk_max_values, max_values)
+        max_indices = torch.where(replace, chunk_max_indices, max_indices)
+
+    assert log_normalizers is not None and max_indices is not None
+    return log_normalizers, max_indices
+
+
+def _streamed_tv_tile(
+    tv: torch.Tensor,
+    tv_probability_dot: torch.Tensor,
+    student_logits: torch.Tensor,
+    student_log_normalizers: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    teacher_log_normalizers: torch.Tensor,
+    teacher_row_indices: torch.Tensor,
+    logit_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    student_probabilities = torch.exp(
+        student_logits.float() * logit_scale - student_log_normalizers.unsqueeze(-1)
+    )
+    unique_teacher_probabilities = torch.exp(
+        teacher_logits.float() * logit_scale - teacher_log_normalizers.unsqueeze(-1)
+    )
+    teacher_probabilities = unique_teacher_probabilities.index_select(
+        0, teacher_row_indices
+    )
+    probability_difference = student_probabilities - teacher_probabilities
+    probability_gradient = 0.5 * torch.sign(probability_difference)
+    return (
+        tv + 0.5 * probability_difference.abs().sum(dim=-1),
+        tv_probability_dot
+        + (student_probabilities * probability_gradient).sum(dim=-1),
+    )
+
+
+def _streamed_tv_kl_tile(
+    tv: torch.Tensor,
+    tv_probability_dot: torch.Tensor,
+    kl: torch.Tensor,
+    teacher_probability_mass: torch.Tensor,
+    student_logits: torch.Tensor,
+    student_log_normalizers: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    teacher_log_normalizers: torch.Tensor,
+    teacher_row_indices: torch.Tensor,
+    logit_scale: float = 1.0,
+    exact_kl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    student_log_probabilities = student_logits.float() * logit_scale - student_log_normalizers.unsqueeze(-1)
+    student_probabilities = torch.exp(student_log_probabilities)
+    unique_teacher_log_probabilities = (
+        teacher_logits.float() * logit_scale - teacher_log_normalizers.unsqueeze(-1)
+    )
+    unique_teacher_probabilities = torch.exp(unique_teacher_log_probabilities)
+    teacher_probabilities = unique_teacher_probabilities.index_select(
+        0, teacher_row_indices
+    )
+    # Reuse normalized teacher logits instead of a full-vocabulary logarithm.
+    if exact_kl:
+        # Filtered tokens have p=0 and log(p)=-inf. Their KL contribution is
+        # zero, not NaN. Keep the true log(p) for every nonzero probability.
+        safe_log_p = torch.where(
+            unique_teacher_probabilities > 0,
+            unique_teacher_log_probabilities,
+            0.0,
+        )
+    else:
+        # Same 1e-9 floor as lk_tv_kl_per_pos:
+        # log(clamp(exp(log_p), 1e-9)) == max(log_p, log(1e-9)).
+        safe_log_p = unique_teacher_log_probabilities.clamp_min(math.log(1e-9))
+    teacher_log_probabilities = safe_log_p.index_select(0, teacher_row_indices)
+    probability_difference = student_probabilities - teacher_probabilities
+    probability_gradient = 0.5 * torch.sign(probability_difference)
+    return (
+        tv + 0.5 * probability_difference.abs().sum(dim=-1),
+        tv_probability_dot
+        + (student_probabilities * probability_gradient).sum(dim=-1),
+        kl
+        + (
+            teacher_probabilities
+            * (teacher_log_probabilities - student_log_probabilities)
+        ).sum(dim=-1),
+        teacher_probability_mass + teacher_probabilities.sum(dim=-1),
+    )
+
+
+def _streamed_tv_kl_backward_tile(
+    student_logits: torch.Tensor,
+    student_log_normalizers: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    teacher_log_normalizers: torch.Tensor,
+    teacher_row_indices: torch.Tensor,
+    tv_probability_dot: torch.Tensor,
+    teacher_probability_mass: torch.Tensor,
+    grad_tv: torch.Tensor,
+    grad_kl: torch.Tensor,
+    output: torch.Tensor,
+    logit_scale: float = 1.0,
+) -> None:
+    student_probabilities = torch.exp(
+        student_logits.float() * logit_scale - student_log_normalizers.unsqueeze(-1)
+    )
+    unique_teacher_probabilities = torch.exp(
+        teacher_logits.float() * logit_scale - teacher_log_normalizers.unsqueeze(-1)
+    )
+    teacher_probabilities = unique_teacher_probabilities.index_select(
+        0, teacher_row_indices
+    )
+    probability_gradient = 0.5 * torch.sign(
+        student_probabilities - teacher_probabilities
+    )
+    tv_logit_gradient = student_probabilities * (
+        probability_gradient - tv_probability_dot.unsqueeze(-1)
+    )
+    kl_logit_gradient = (
+        student_probabilities * teacher_probability_mass.unsqueeze(-1)
+        - teacher_probabilities
+    )
+    output.copy_(
+        (
+            (
+                grad_tv.unsqueeze(-1) * tv_logit_gradient
+                + grad_kl.unsqueeze(-1) * kl_logit_gradient
+            ) * logit_scale
+        ).to(student_logits.dtype)
+    )
+
+
+def _streamed_tv_backward_tile(
+    student_logits: torch.Tensor,
+    student_log_normalizers: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    teacher_log_normalizers: torch.Tensor,
+    teacher_row_indices: torch.Tensor,
+    tv_probability_dot: torch.Tensor,
+    grad_tv: torch.Tensor,
+    output: torch.Tensor,
+    logit_scale: float = 1.0,
+) -> None:
+    student_probabilities = torch.exp(
+        student_logits.float() * logit_scale - student_log_normalizers.unsqueeze(-1)
+    )
+    unique_teacher_probabilities = torch.exp(
+        teacher_logits.float() * logit_scale - teacher_log_normalizers.unsqueeze(-1)
+    )
+    teacher_probabilities = unique_teacher_probabilities.index_select(
+        0, teacher_row_indices
+    )
+    probability_gradient = 0.5 * torch.sign(
+        student_probabilities - teacher_probabilities
+    )
+    tv_logit_gradient = student_probabilities * (
+        probability_gradient - tv_probability_dot.unsqueeze(-1)
+    )
+    output.copy_((grad_tv.unsqueeze(-1) * tv_logit_gradient * logit_scale).to(student_logits.dtype))
+
+
+_compiled_streamed_tv_tile = torch.compile(
+    _streamed_tv_tile,
+    dynamic=True,
+    fullgraph=True,
+)
+_compiled_streamed_tv_kl_tile = torch.compile(
+    _streamed_tv_kl_tile,
+    dynamic=True,
+    fullgraph=True,
+)
+_compiled_streamed_tv_kl_backward_tile = torch.compile(
+    _streamed_tv_kl_backward_tile,
+    dynamic=True,
+    fullgraph=True,
+)
+_compiled_streamed_tv_backward_tile = torch.compile(
+    _streamed_tv_backward_tile,
+    dynamic=True,
+    fullgraph=True,
+)
+
+
+def _use_compiled_streaming_loss(tensor: torch.Tensor) -> bool:
+    return tensor.device.type == "cuda" and not torch.compiler.is_compiling()
+
+
+@torch.no_grad()
+def _streaming_tv_kl_forward(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    teacher_log_normalizers: torch.Tensor,
+    teacher_row_indices: torch.Tensor,
+    vocab_chunk_size: int,
+    *,
+    compute_kl: bool,
+    student_log_normalizers: torch.Tensor | None = None,
+    logit_scale: float = 1.0,
+    exact_kl: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    if student_log_normalizers is None:
+        student_log_normalizers = _streaming_log_normalizers(
+            student_logits,
+            vocab_chunk_size,
+            logit_scale,
+        )
+    tv = torch.zeros_like(student_log_normalizers)
+    tv_probability_dot = torch.zeros_like(student_log_normalizers)
+    kl = torch.zeros_like(student_log_normalizers)
+    teacher_probability_mass = torch.zeros_like(student_log_normalizers)
+    use_compiled = _use_compiled_streaming_loss(student_logits)
+    # At T=1 the tiles use their default logit_scale.
+    sampling_kwargs = {"logit_scale": logit_scale} if logit_scale != 1.0 else {}
+    kl_kwargs = {**sampling_kwargs, "exact_kl": True} if exact_kl else sampling_kwargs
+
+    for chunk_start in range(0, student_logits.shape[-1], vocab_chunk_size):
+        chunk_end = min(chunk_start + vocab_chunk_size, student_logits.shape[-1])
+        student_chunk = student_logits[:, chunk_start:chunk_end]
+        teacher_chunk = teacher_logits[:, chunk_start:chunk_end]
+        if compute_kl:
+            kernel = (
+                _compiled_streamed_tv_kl_tile
+                if use_compiled
+                else _streamed_tv_kl_tile
+            )
+            tv, tv_probability_dot, kl, teacher_probability_mass = kernel(
+                tv,
+                tv_probability_dot,
+                kl,
+                teacher_probability_mass,
+                student_chunk,
+                student_log_normalizers,
+                teacher_chunk,
+                teacher_log_normalizers,
+                teacher_row_indices,
+                **kl_kwargs,
+            )
+        else:
+            kernel = _compiled_streamed_tv_tile if use_compiled else _streamed_tv_tile
+            tv, tv_probability_dot = kernel(
+                tv,
+                tv_probability_dot,
+                student_chunk,
+                student_log_normalizers,
+                teacher_chunk,
+                teacher_log_normalizers,
+                teacher_row_indices,
+                **sampling_kwargs,
+            )
+
+    return (
+        tv,
+        kl,
+        student_log_normalizers,
+        tv_probability_dot,
+        teacher_probability_mass,
+    )
+
+
+class _StreamingTVKL(torch.autograd.Function):
+    """Full-vocabulary TV/KL values with a tile-wise analytical backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        teacher_log_normalizers: torch.Tensor,
+        teacher_row_indices: torch.Tensor,
+        student_log_normalizers: torch.Tensor,
+        vocab_chunk_size: int,
+        compute_kl: bool,
+        logit_scale: float,
+        exact_kl: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        (
+            tv,
+            kl,
+            student_log_normalizers,
+            tv_probability_dot,
+            teacher_probability_mass,
+        ) = _streaming_tv_kl_forward(
+            student_logits,
+            teacher_logits,
+            teacher_log_normalizers,
+            teacher_row_indices,
+            vocab_chunk_size,
+            compute_kl=compute_kl,
+            student_log_normalizers=student_log_normalizers,
+            logit_scale=logit_scale,
+            exact_kl=exact_kl,
+        )
+        ctx.vocab_chunk_size = vocab_chunk_size
+        ctx.compute_kl = compute_kl
+        ctx.logit_scale = logit_scale
+        ctx.save_for_backward(
+            student_logits,
+            teacher_logits,
+            teacher_log_normalizers,
+            teacher_row_indices,
+            student_log_normalizers,
+            tv_probability_dot,
+            teacher_probability_mass,
+        )
+        ctx.set_materialize_grads(False)
+        return tv, kl
+
+    @staticmethod
+    def backward(ctx, grad_tv, grad_kl):
+        if grad_tv is None and grad_kl is None:
+            return (None,) * 9
+        (
+            student_logits,
+            teacher_logits,
+            teacher_log_normalizers,
+            teacher_row_indices,
+            student_log_normalizers,
+            tv_probability_dot,
+            teacher_probability_mass,
+        ) = ctx.saved_tensors
+        if grad_tv is None:
+            grad_tv = torch.zeros_like(student_log_normalizers)
+        if grad_kl is None or not ctx.compute_kl:
+            grad_kl = torch.zeros_like(student_log_normalizers)
+
+        grad_logits = torch.empty_like(student_logits)
+        use_compiled = _use_compiled_streaming_loss(student_logits)
+        if ctx.compute_kl:
+            kernel = (
+                _compiled_streamed_tv_kl_backward_tile
+                if use_compiled
+                else _streamed_tv_kl_backward_tile
+            )
+        else:
+            kernel = (
+                _compiled_streamed_tv_backward_tile
+                if use_compiled
+                else _streamed_tv_backward_tile
+            )
+        for chunk_start in range(0, student_logits.shape[-1], ctx.vocab_chunk_size):
+            chunk_end = min(chunk_start + ctx.vocab_chunk_size, student_logits.shape[-1])
+            # Let the compiled tile write its final dtype conversion directly
+            # into the full gradient. Returning a contiguous temporary here
+            # requires another full-vocabulary copy into these strided slices.
+            output_chunk = grad_logits[:, chunk_start:chunk_end]
+            common_args = (
+                student_logits[:, chunk_start:chunk_end],
+                student_log_normalizers,
+                teacher_logits[:, chunk_start:chunk_end],
+                teacher_log_normalizers,
+                teacher_row_indices,
+                tv_probability_dot,
+            )
+            if ctx.compute_kl:
+                kernel(
+                    *common_args,
+                    teacher_probability_mass,
+                    grad_tv,
+                    grad_kl,
+                    output_chunk,
+                    ctx.logit_scale,
+                )
+            else:
+                kernel(*common_args, grad_tv, output_chunk, ctx.logit_scale)
+        return grad_logits, None, None, None, None, None, None, None, None
+
+
+def streaming_tv_kl_per_pos(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    teacher_row_indices: torch.Tensor,
+    *,
+    vocab_chunk_size: int,
+    teacher_log_normalizers: torch.Tensor | None = None,
+    student_log_normalizers: torch.Tensor | None = None,
+    compute_kl: bool = True,
+    distribution_aware: bool = False,
+    temperature: float = 1.0,
+    top_k: int = -1,
+    top_p: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stream exact full-vocabulary TV and optional KL for each student row.
+
+    ``teacher_logits`` contains only unique target positions and
+    ``teacher_row_indices`` maps each student row to its teacher row. Teacher
+    values are detached. FP32 probability math matches :func:`lk_tv_kl_per_pos`
+    while avoiding full-vocabulary FP32 softmax tensors and their autograd graph.
+
+    Distribution-aware mode uses the target's temperature/top-k/top-p and an
+    unfiltered draft at the same temperature, including the 1/T Jacobian. Its
+    KL is the true KL(p||q), with zero mass outside the teacher support. The
+    default mode uses T=1 and the 1e-9 log-probability floor of
+    :func:`lk_tv_kl_per_pos`. Supplied teacher normalizers describe raw T=1
+    logits; a non-default policy recomputes them after filtering. Supplied
+    student normalizers must already match the selected loss temperature.
+    Small top-k policies use compact teacher support and an analytical
+    full-draft gradient; other policies, and top-k ties that exceed the
+    compact capacity, use the dense path.
+    """
+    if student_logits.ndim != 2 or teacher_logits.ndim != 2:
+        raise ValueError("student and teacher logits must both have shape [rows, vocabulary]")
+    if student_logits.shape[-1] != teacher_logits.shape[-1]:
+        raise ValueError("student and teacher vocabulary sizes must match")
+    if teacher_row_indices.shape != student_logits.shape[:1]:
+        raise ValueError("teacher_row_indices must have one entry per student row")
+    if vocab_chunk_size < 1:
+        raise ValueError(f"vocab_chunk_size must be >= 1, got {vocab_chunk_size}")
+    if student_logits.device != teacher_logits.device:
+        raise ValueError("student and teacher logits must be on the same device")
+
+    logit_scale = 1.0
+    if distribution_aware:
+        if temperature == 0:
+            raise ValueError("Distribution-aware e2e/LK training requires temperature > 0")
+        validate_sampling_parameters(temperature, top_k, top_p, allow_greedy=False)
+        logit_scale = 1.0 / temperature
+        if 0 < top_k <= 128 and top_k < teacher_logits.shape[-1]:
+            sparse_target = prepare_distill_sparse_target(
+                teacher_logits, temperature=temperature, top_k=top_k, top_p=top_p,
+            )
+            if sparse_target is not None:
+                return sparse_tv_kl_per_pos(
+                    student_logits, sparse_target, teacher_row_indices,
+                    vocab_chunk_size=vocab_chunk_size,
+                    student_log_normalizers=student_log_normalizers,
+                    compute_kl=compute_kl, temperature=temperature,
+                )
+        if temperature != 1.0 or top_k != -1 or top_p != 1.0:
+            # Share EDR's vLLM-PyTorch reconstruction, including FP32
+            # temperature scaling, top-k ties and the ascending top-p cutoff.
+            # Filtering workspace stays bounded and retained logits stay BF16.
+            target = prepare_edr_target_distribution(
+                teacher_logits, vocab_chunk_size,
+                temperature=temperature, top_k=top_k, top_p=top_p,
+            )
+            teacher_logits = target.logits
+            teacher_log_normalizers = target.log_normalizers
+
+    teacher_logits = teacher_logits.detach()
+    teacher_row_indices = teacher_row_indices.to(
+        device=student_logits.device,
+        dtype=torch.long,
+    )
+    if teacher_log_normalizers is None:
+        teacher_log_normalizers = _streaming_log_normalizers(
+            teacher_logits,
+            vocab_chunk_size,
+        )
+    teacher_log_normalizers = teacher_log_normalizers.detach().to(
+        device=student_logits.device,
+        dtype=torch.float32,
+    )
+    if teacher_log_normalizers.shape != teacher_logits.shape[:1]:
+        raise ValueError("teacher_log_normalizers must have one value per teacher row")
+    if student_log_normalizers is None:
+        student_log_normalizers = _streaming_log_normalizers(
+            student_logits,
+            vocab_chunk_size,
+            logit_scale,
+        )
+    student_log_normalizers = student_log_normalizers.detach().to(
+        device=student_logits.device,
+        dtype=torch.float32,
+    )
+    if student_log_normalizers.shape != student_logits.shape[:1]:
+        raise ValueError("student_log_normalizers must have one value per student row")
+
+    if not torch.is_grad_enabled() or not student_logits.requires_grad:
+        tv, kl, *_ = _streaming_tv_kl_forward(
+            student_logits,
+            teacher_logits,
+            teacher_log_normalizers,
+            teacher_row_indices,
+            int(vocab_chunk_size),
+            compute_kl=bool(compute_kl),
+            student_log_normalizers=student_log_normalizers,
+            logit_scale=logit_scale,
+            exact_kl=bool(distribution_aware),
+        )
+        return tv, kl
+    return _StreamingTVKL.apply(
+        student_logits,
+        teacher_logits,
+        teacher_log_normalizers,
+        teacher_row_indices,
+        student_log_normalizers,
+        int(vocab_chunk_size),
+        bool(compute_kl),
+        logit_scale,
+        bool(distribution_aware),
+    )
 
 
 def _forward_kl_from_logits(logits: torch.Tensor, target_p: torch.Tensor) -> torch.Tensor:
@@ -419,10 +961,10 @@ def opd_two_stream_kl_from_hs(
     """Two-stream reverse-KL(k3) OPD loss over the DFlash proposal tree.
 
     Two KL terms (response + rejected-draft stream) over the half-OPD proposal tree.
-    The M scored slots are branch-major × within-branch, EXACTLY ``block_size-1``
+    The M scored slots are branch-major × within-branch, exactly ``block_size``
     per branch (see ``tree_layout.build_dflash_opd_layout``), so a reshape to
-    ``(num_branches, block_size-1)`` recovers per-branch rows whose columns run in
-    ascending block offset ``1..block_size-1``.
+    ``(num_branches, block_size)`` recovers per-branch rows whose columns run in
+    ascending learned proposal position ``1..block_size``.
 
     Greedy verify per branch (matches the serving rule
     ``candidates == target_predict``): accept the prefix where the draft-proposed
@@ -439,9 +981,9 @@ def opd_two_stream_kl_from_hs(
         (opd_loss, metrics) where ``metrics`` values are un-averaged sum/count
         scalars (detached) so the trainer can DP-reduce them correctly.
     """
-    width = int(block_size) - 1
+    width = int(block_size)
     if width <= 0:
-        raise ValueError(f"block_size must be >= 2, got {block_size}")
+        raise ValueError(f"block_size must be >= 1, got {block_size}")
     M = int(student_hidden.shape[0])
     device = student_hidden.device
     if M == 0:
@@ -449,8 +991,8 @@ def opd_two_stream_kl_from_hs(
         return z, {k: z.detach().clone() for k in _OPD_METRIC_KEYS}
     if M % width != 0:
         raise ValueError(
-            f"OPD scored-slot count {M} not divisible by (block_size-1)={width}; "
-            "layout invariant (B-1 scored slots per branch) violated."
+            f"OPD scored-slot count {M} not divisible by block_size={width}; "
+            "layout invariant (B learned slots per branch) violated."
         )
     if not (0.0 < position_decay <= 1.0):
         raise ValueError(f"position_decay must be in (0, 1], got {position_decay}")

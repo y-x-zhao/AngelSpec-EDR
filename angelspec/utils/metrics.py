@@ -3,6 +3,48 @@ from __future__ import annotations
 import torch
 
 
+def edr_metric_totals(metrics: list[dict]) -> torch.Tensor:
+    """Build EDR [surrogate sum, weighted cost, count, degenerate, tokens] totals.
+
+    The backward surrogate is already summed over horizons within each row;
+    weighted costs ``1 + U[0, 1]`` and generated-token counts are also
+    additive. MAL is formed only after these totals have been combined globally.
+    """
+    if not metrics:
+        raise ValueError("EDR metric reduction requires at least one metric dictionary")
+    reference = metrics[0]["edr_num_horizons"]
+    totals = torch.zeros(5, device=reference.device, dtype=torch.float32)
+    for metric in metrics:
+        horizon_count = metric["edr_num_horizons"].float()
+        totals[0] += metric["edr_surrogate_loss"].float()
+        totals[1] += metric["edr_weighted_cost_sum"].float()
+        totals[2] += horizon_count
+        totals[3] += metric["edr_num_degenerate_horizons"].float()
+        totals[4] += metric["edr_generated_tokens"].float()
+    return totals
+
+
+def edr_metrics_from_totals(totals: torch.Tensor, prefix: str) -> dict[str, float]:
+    """Convert globally summed EDR totals into user-facing metrics."""
+    if totals.shape != (5,):
+        raise ValueError(f"EDR totals must have shape (5,), got {tuple(totals.shape)}")
+    horizon_count = totals[2]
+    denominator = horizon_count.clamp(min=1.0)
+    surrogate = totals[0] / denominator
+    # Count each horizon's terminal EOS/stop/length-boundary token, matching the
+    # offline evaluator's sampled-output length (ordinary tokens + 1).
+    mal = (totals[4] + horizon_count) / totals[1].clamp_min(1.0)
+    return {
+        f"{prefix}edr_surrogate_loss": surrogate.item(),
+        f"{prefix}edr_generated_tokens": totals[4].item(),
+        f"{prefix}edr_weighted_cost": totals[1].item(),
+        f"{prefix}edr_mal": mal.item(),
+        f"{prefix}edr_num_horizons": horizon_count.item(),
+        f"{prefix}edr_num_degenerate_horizons": totals[3].item(),
+        f"{prefix}edr_mean_horizon_length": (totals[4] / denominator).item(),
+    }
+
+
 def token_metric_totals(
     metrics: list[dict],
     *,

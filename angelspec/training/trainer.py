@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
 import abc
 import concurrent.futures
 import dataclasses
@@ -27,7 +29,7 @@ import os
 import time
 from argparse import Namespace
 from contextlib import nullcontext
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.distributed as dist
@@ -47,7 +49,6 @@ from angelspec.training import checkpoint
 from angelspec.training.data_fetcher import MooncakeDataFetcher, PrefetchedDataFetcher
 from angelspec.training.fsdp import init_empty_weights
 from angelspec.training.optimizer import BF16Optimizer
-from angelspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 from angelspec.utils.distributed import get_usp_device_mesh, get_usp_grad_sync_mesh
 from angelspec.utils.logging import logger
 from angelspec.utils.metrics import token_weighted_loss_scale
@@ -55,6 +56,9 @@ from angelspec.utils.processing import get_assistant_token_ids
 from angelspec.utils.profiling import TrainProfiler
 from angelspec.utils.train_dump import extract_gradients, extract_model_weights
 from angelspec.utils.usp import usp_dp_average_factor
+
+if TYPE_CHECKING:
+    from angelspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 
 
 def _with_lookahead_islast(iterable, known_count: Optional[int] = None):
@@ -78,6 +82,56 @@ def _with_lookahead_islast(iterable, known_count: Optional[int] = None):
         yield prev, False
         prev = cur
     yield prev, True
+
+
+def _check_finite_step_losses(step_metrics: list[dict], step: int) -> None:
+    """Raise on every rank if a step loss metric is non-finite, before the optimizer update.
+
+    Analytical losses can be non-finite while their gradients are finite, and
+    LK/e2e-only training logs a detached CE that is absent from the optimized
+    loss. The check runs once per optimizer step, after backward on all ranks,
+    instead of a host sync per microbatch.
+    """
+    entries = [
+        (batch_idx, name, value.detach().float().reshape(-1))
+        for batch_idx, metrics in enumerate(step_metrics)
+        for name, value in metrics.items()
+        if (name in {"loss", "loss_per_position"} or name.endswith("_loss"))
+        and isinstance(value, torch.Tensor)
+    ]
+    if not entries:
+        return
+
+    values = torch.cat([value for _, _, value in entries])
+    finite = torch.isfinite(values)
+    all_finite = finite.all().to(torch.int32)
+    distributed = dist.is_initialized() and dist.get_world_size() > 1
+    if distributed:
+        # All ranks raise together; a rank-local error would leave peers blocked
+        # in optimizer collectives or updating after another rank's invalid forward.
+        dist.all_reduce(all_finite, op=dist.ReduceOp.MIN)
+    if bool(all_finite):
+        return
+
+    # Only the failure path transfers per-field diagnostics to the host.
+    flags = finite.cpu().tolist()
+    offset = 0
+    bad_fields = []
+    for batch_idx, name, value in entries:
+        count = value.numel()
+        if not all(flags[offset:offset + count]):
+            bad_fields.append(f"microbatch={batch_idx} {name}")
+        offset += count
+    detail = ", ".join(bad_fields[:8]) if bad_fields else "non-finite loss on another rank"
+    if len(bad_fields) > 8:
+        detail += f" (and {len(bad_fields) - 8} more fields)"
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    raise RuntimeError(
+        f"Non-finite training loss/metrics at step={step}, rank={rank}: {detail}. "
+        "Optimizer, LR scheduler, and completed-step counter were not advanced. "
+        "For LK/e2e, loss_per_position/ce_loss is student CE, not the LK/e2e objective; "
+        "non-finite CE requires checking the student forward/log-normalizers."
+    )
 
 
 class Trainer(abc.ABC):
@@ -184,6 +238,10 @@ class Trainer(abc.ABC):
         self,
         mooncake_config: Optional[MooncakeConfig] = None,
     ) -> EagleMooncakeStore:
+        # Imported lazily: single-GPU training runs without Mooncake and its
+        # native RDMA libraries.
+        from angelspec.transfer.mooncake.eagle_store import EagleMooncakeStore
+
         if mooncake_config is None:
             mooncake_config = MooncakeConfig.from_flat_args(self.args)
 
@@ -524,21 +582,25 @@ class Trainer(abc.ABC):
                         denom,
                         dp_world_size,
                     )
-                batch_iter = _with_lookahead_islast(iter(step_batches), known_count=num_micro)
+                batch_iter = iter(step_batches)
             else:
                 # Equal-weight: each row's loss divided by fixed num_batches in
                 # _backward; rows stream lazily, last marked without look-ahead.
-                batch_iter = _with_lookahead_islast(
-                    self.data_fetcher.iter_step_batches(num_micro), known_count=num_micro
-                )
-            batches = self.prof.iterate_train_actor(batch_iter)
+                batch_iter = self.data_fetcher.iter_step_batches(num_micro)
         else:
             num_micro = num_batches
-            batches = self.prof.iterate_train_actor(
-                _with_lookahead_islast(
-                    self._iter_batches_from_queue(num_batches), known_count=num_batches
-                )
+            batch_iter = self._iter_batches_from_queue(num_batches)
+
+        batch_iter, num_compute_batches = self._prepare_training_batches(
+            batch_iter,
+            num_micro,
+        )
+        batches = self.prof.iterate_train_actor(
+            _with_lookahead_islast(
+                batch_iter,
+                known_count=num_compute_batches,
             )
+        )
 
         # Token accounting for throughput (covers packed + pad-to-longest):
         # tok_seq = non-pad tokens forwarded, tok_sup = supervised, tok_slots = padded
@@ -551,11 +613,17 @@ class Trainer(abc.ABC):
         for batch_idx, (batch, is_last) in enumerate(batches):
             rows_seen += 1
 
-            if "attention_mask" in batch:
-                tok_seq += int(batch["attention_mask"].sum().item())
-                tok_slots += int(batch["attention_mask"].numel())
-            if "loss_mask" in batch:
-                tok_sup += int(batch["loss_mask"].sum().item())
+            if "_token_counts" in batch:
+                seq_tokens, supervised_tokens, slots = batch["_token_counts"]
+                tok_seq += seq_tokens
+                tok_sup += supervised_tokens
+                tok_slots += slots
+            else:
+                if "attention_mask" in batch:
+                    tok_seq += int(batch["attention_mask"].sum().item())
+                    tok_slots += int(batch["attention_mask"].numel())
+                if "loss_mask" in batch:
+                    tok_sup += int(batch["loss_mask"].sum().item())
 
             if perf:
                 data_time += time.time() - t_data_start
@@ -586,6 +654,7 @@ class Trainer(abc.ABC):
                 )
 
             if is_last:
+                _check_finite_step_losses([*all_step_metrics, step_metrics], step)
                 self._maybe_dump(batch, step_metrics, step, batch_idx)
                 _usp_dbg = os.environ.get("ANGELSPEC_USP_COLLECTIVE_DEBUG") == "1"
                 if usp_manual_grad:
@@ -670,7 +739,12 @@ class Trainer(abc.ABC):
         # Guard the data-path contract: the fetcher must yield dict batches, not a
         # DataLoader / (dataloader, dataset, collator) tuple — a routing regression
         # otherwise surfaces as an opaque 'DataLoader' not subscriptable in _forward.
-        for batch in itertools.islice(self.data_fetcher, num_batches):
+        group_size = getattr(self.data_fetcher, "microbatches_per_item", 1)
+        if num_batches % group_size:
+            raise ValueError("requested microbatch count must be divisible by the prefetch group size")
+        if group_size > 1 and num_batches != self.data_fetcher.rows_per_step:
+            raise ValueError("grouped prefetch requires the configured optimizer accumulation window")
+        for batch in itertools.islice(self.data_fetcher, num_batches // group_size):
             if not isinstance(batch, dict):
                 raise TypeError(
                     f"data fetcher yielded {type(batch).__name__}, expected a dict "
@@ -678,6 +752,16 @@ class Trainer(abc.ABC):
                     "un-unpacked create_mooncake_dataloader tuple)."
                 )
             yield batch
+
+    def _prepare_training_batches(self, batches, num_batches: int):
+        """Transform the microbatch stream while preserving loss normalization.
+
+        The default path is identity. Specialized trainers may combine several
+        additive microbatches into one model call; ``num_batches`` returned here
+        controls only last-backward/synchronization detection. The original
+        accumulation count remains the loss divisor.
+        """
+        return batches, num_batches
 
     def _usp_manual_grad_allreduce(self) -> None:
         """Reduce USP grads with SP-SUM and DP-AVG semantics.

@@ -110,7 +110,7 @@ def _hyv3_inner_forward(self, input_ids, positions, intermediate_tensors=None, i
 
     NOTE: the fork's forward also has a ``get_tpsp_ctx()`` sequence-parallel
     chunk/all-gather path. AngelSpec hidden-state extraction runs the target at
-    tp=1 (see ``configs/vllm_hy3_mtp.yaml`` / dflash configs), where
+    tp=1 (see the DFlash-family configs), where
     ``get_tpsp_ctx()`` is ``None`` and that path is a no-op, so it is omitted
     here. If a hy_v3 target is ever served at tp>1 for extraction, this body
     must be extended to mirror the tpsp chunk/all-gather.

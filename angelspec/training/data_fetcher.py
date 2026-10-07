@@ -176,8 +176,8 @@ class MooncakeDataset(IterableDataset):
             # (Issue 31). Note: clone() unpins, breaking non_blocking H2D — only here.
             result = {k: v.clone() for k, v in tensor_dict.items()}
         else:
-            # batch_size=1: safe to use pinned views — consumed immediately.
-            # Preserves pinned memory for async H2D via non_blocking=True.
+            # The store returns owned CPU tensors for prefetch. GPU-direct views
+            # on the synchronous batch_size=1 path are consumed before the next get.
             result = dict(tensor_dict)
 
         self._cleanup_mooncake_data(sample)

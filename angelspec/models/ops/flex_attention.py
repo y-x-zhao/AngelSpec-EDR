@@ -18,12 +18,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
+import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import torch
 import torch._dynamo as dynamo
 import torch._inductor.config as inductor_config
+import torch.nn.functional as F
+from torch._inductor.exc import InductorError
 from torch.nn.attention.flex_attention import (
     BlockMask,
     create_block_mask,
+    create_mask,
     flex_attention,
     or_masks,
 )
@@ -46,6 +54,82 @@ except AttributeError:
 # NoValidChoicesError during FlexAttention backward (Issue 10).
 if "ATEN" not in getattr(inductor_config, "max_autotune_gemm_backends", ""):
     inductor_config.max_autotune_gemm_backends = "ATEN,TRITON"
+
+_force_dense_sdpa = False
+_DEFAULT_DENSE_FALLBACK_MAX_MASK_ELEMENTS = 64 * 1024 * 1024
+_DENSE_FALLBACK_MAX_MASK_ELEMENTS_ENV = "ANGELSPEC_DENSE_FALLBACK_MAX_MASK_ELEMENTS"
+
+
+def dense_sdpa_fallback_max_mask_elements() -> int:
+    """Return the configured dense-mask safety limit in boolean elements."""
+    raw_limit = os.environ.get(_DENSE_FALLBACK_MAX_MASK_ELEMENTS_ENV)
+    if raw_limit is None:
+        return _DEFAULT_DENSE_FALLBACK_MAX_MASK_ELEMENTS
+    try:
+        limit = int(raw_limit)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{_DENSE_FALLBACK_MAX_MASK_ELEMENTS_ENV} must be a positive integer, "
+            f"got {raw_limit!r}"
+        ) from exc
+    if limit < 1:
+        raise RuntimeError(
+            f"{_DENSE_FALLBACK_MAX_MASK_ELEMENTS_ENV} must be a positive integer, "
+            f"got {raw_limit!r}"
+        )
+    return limit
+
+
+def dense_sdpa_fallback_active() -> bool:
+    """Whether this process switched from FlexAttention to dense-mask SDPA."""
+
+    return _force_dense_sdpa
+
+
+def force_dense_sdpa_fallback() -> None:
+    """Select dense SDPA before entering a checkpointed attention graph.
+
+    FlexAttention can compile its forward successfully and fail only while
+    compiling backward. Switching implementations during non-reentrant
+    checkpoint recomputation changes the saved-tensor graph and PyTorch rejects
+    it. Callers that know they will checkpoint this attention path can select
+    the exact dense implementation up front, keeping forward and recomputation
+    structurally identical.
+    """
+
+    global _force_dense_sdpa
+    _force_dense_sdpa = True
+
+
+@contextmanager
+def forced_dense_sdpa_fallback() -> Iterator[None]:
+    """Force dense SDPA only for the lifetime of one checkpointed operation."""
+
+    global _force_dense_sdpa
+    previous = _force_dense_sdpa
+    _force_dense_sdpa = True
+    try:
+        yield
+    finally:
+        _force_dense_sdpa = previous
+
+
+@contextmanager
+def isolated_flex_attention_fallback() -> Iterator[None]:
+    """Keep a shape-local fallback from affecting a later attention phase.
+
+    A detached EDR statistics shape may require dense SDPA even when the fixed
+    gradient shape has a valid sparse kernel. Preserve the process-wide state
+    on entry, allow fallback reuse within the isolated phase, then restore the
+    original choice before the gradient-enabled forward.
+    """
+
+    global _force_dense_sdpa
+    previous = _force_dense_sdpa
+    try:
+        yield
+    finally:
+        _force_dense_sdpa = previous
 
 
 # Reference Implementation https://github.com/huggingface/transformers/blob/main/src/transformers/integrations/flex_attention.py
@@ -79,23 +163,89 @@ class WrappedFlexAttention:
         return self._compiled_flex_attention
 
 
+def _dense_sdpa_fallback(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kwargs,
+) -> torch.Tensor:
+    """Exact small-mask fallback for an unavailable FlexAttention kernel."""
+
+    # ``kernel_options`` only selects/configures the FlexAttention kernel; it
+    # does not change attention semantics and is intentionally ignored here.
+    unsupported = set(kwargs) - {"block_mask", "enable_gqa", "scale", "kernel_options"}
+    block_mask = kwargs.get("block_mask")
+    if unsupported or not isinstance(block_mask, BlockMask):
+        raise RuntimeError(
+            "Dense SDPA fallback only supports block_mask, enable_gqa, scale, "
+            "and kernel_options"
+        )
+    batch, heads, query_length, _ = query.shape
+    key_length = key.shape[-2]
+    mask_elements = batch * heads * query_length * key_length
+    max_mask_elements = dense_sdpa_fallback_max_mask_elements()
+    if mask_elements > max_mask_elements:
+        raise RuntimeError(
+            "Refusing to materialize an oversized dense attention mask after "
+            f"FlexAttention compilation failed ({mask_elements} elements exceeds "
+            f"the {max_mask_elements} element limit). Reduce the attention shape or "
+            f"raise {_DENSE_FALLBACK_MAX_MASK_ELEMENTS_ENV}."
+        )
+    dense_mask = create_mask(
+        block_mask.mask_mod,
+        B=batch,
+        H=heads,
+        Q_LEN=query_length,
+        KV_LEN=key_length,
+        device=query.device,
+    )
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=dense_mask,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=kwargs.get("scale"),
+        enable_gqa=bool(kwargs.get("enable_gqa", False)),
+    )
+
+
 def compile_friendly_flex_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     **kwargs,
 ) -> torch.Tensor:
+    global _force_dense_sdpa
+
+    if _force_dense_sdpa:
+        return _dense_sdpa_fallback(query, key, value, kwargs)
     # First call initialise singleton wrapper object, second call invokes the object method to return compiled flex attention
     # Do not use compiled version if already compiling forward (it raises issues)
     flex_attention_compiled = (
         WrappedFlexAttention()() if not is_torchdynamo_compiling() else flex_attention
     )
-    return flex_attention_compiled(
-        query,
-        key,
-        value,
-        **kwargs,
-    )
+    try:
+        return flex_attention_compiled(
+            query,
+            key,
+            value,
+            **kwargs,
+        )
+    except InductorError as error:
+        message = str(error)
+        if "NoValidChoicesError" not in message and "No choices exist for backend" not in message:
+            raise
+        output = _dense_sdpa_fallback(query, key, value, kwargs)
+        _force_dense_sdpa = True
+        warnings.warn(
+            "FlexAttention has no valid TorchInductor kernel for this GPU/shape; "
+            "using the exact dense-mask SDPA fallback for this process.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return output
 
 
 def compile_friendly_create_block_mask(
@@ -319,9 +469,9 @@ def build_eagle3_block_mask(
     Q_BS, KV_BS = _normalize_block_size(BLOCK_SIZE)
     assert Q_LEN % Q_BS == 0 and KV_LEN % KV_BS == 0
     assert Q_BS % KV_BS == 0, f"Q_BS ({Q_BS}) must be a multiple of KV_BS ({KV_BS})"
-    assert (
-        KV_LEN % Q_LEN == 0
-    ), f"build_eagle3_block_mask requires KV_LEN to be a multiple of Q_LEN; got Q_LEN={Q_LEN}, KV_LEN={KV_LEN}"
+    assert KV_LEN % Q_LEN == 0, (
+        f"build_eagle3_block_mask requires KV_LEN to be a multiple of Q_LEN; got Q_LEN={Q_LEN}, KV_LEN={KV_LEN}"
+    )
 
     # Skip the compiled path when nested inside another torch.compile graph.
     builder = (

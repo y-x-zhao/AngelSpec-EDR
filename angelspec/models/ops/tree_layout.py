@@ -263,10 +263,10 @@ def build_dflash_opd_layout(
 ) -> tuple["TreeLayout", torch.Tensor]:
     """DFlash proposal → OPD tree layout + aligned student draft-hidden slots.
 
-    DFlash's block layout is ``[anchor_slot(0), pred@1 .. pred@{B-1}]``: slot 0 is
-    the anchor input, slots 1..B-1 predict absolute positions ``anchor+1..anchor+B-1``.
-    So the branch is the B-1 proposals at slots 1..B-1, and the student for branch
-    token j (position anchor+1+j) is the draft hidden at block slot j+1.
+    Every DFlash proposal slot is an output: slot ``j`` predicts absolute
+    position ``anchor+1+j``. The anchor token is an input and is not part of
+    ``proposals``. The branch therefore contains all B proposal IDs, aligned
+    with all B student hidden slots.
 
     ``max_anchors`` caps how many valid anchors are scored (evenly subsampled) —
     the OPD scoring cost scales with anchors*block, so this bounds the packed-tree
@@ -281,10 +281,10 @@ def build_dflash_opd_layout(
 
     Returns:
         (layout, student_slots) where ``layout`` is the packed tree over the valid
-        anchors' branches (block length B-1), and ``student_slots`` (M,) indexes the
+        anchors' branches (block length B), and ``student_slots`` (M,) indexes the
         draft hidden's flat ``[n_blocks*block_size]`` axis at the branch slots,
         ordered branch-major × within-branch to match ``layout.score_index`` /
-        ``layout.score_target_ids`` (M = n_valid * (B-1)).
+        ``layout.score_target_ids`` (M = n_valid * B).
     """
     if proposals.dim() != 2 or proposals.shape[1] != block_size:
         raise ValueError(
@@ -296,12 +296,12 @@ def build_dflash_opd_layout(
         sel = torch.linspace(0, keep.numel() - 1, steps=max_anchors).round().long().unique()
         keep = keep[sel]
     anchors = anchor_positions.index_select(0, keep)
-    branch_tokens = proposals.index_select(0, keep)[:, 1:block_size]  # (n_valid, B-1)
+    branch_tokens = proposals.index_select(0, keep)  # (n_valid, B)
     layout = build_tree_layout(trunk_ids, anchors, branch_tokens, max_position=max_position)
-    # Student slots: valid block k contributes flat draft-hidden slots
-    # k*B+1 .. k*B+(B-1), in valid-block order — matches build_tree_layout's
+    # Student slots: valid block k contributes all flat draft-hidden slots
+    # k*B .. k*B+(B-1), in valid-block order — matches build_tree_layout's
     # branch-major × within-branch score_index ordering.
-    within = torch.arange(1, block_size, device=device)
+    within = torch.arange(block_size, device=device)
     student_slots = (keep.view(-1, 1) * block_size + within.view(1, -1)).reshape(-1)
     return layout, student_slots
 

@@ -1,0 +1,72 @@
+{
+  "repository": "https://github.com/deepseek-ai/DeepSpec",
+  "revision": "005e03b81cec38b7da6399833d609ee89a2587f2",
+  "selection_seed": 980406,
+  "selection": "shuffle only if source count exceeds TASKS limit; then take limit",
+  "prompt": "exact turns[0], no additional formatting",
+  "datasets": {
+    "gsm8k": {
+      "source_url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/eval_datasets/gsm8k.jsonl",
+      "source_rows": 1319,
+      "prompts": 500,
+      "source_sha256": "63330a20a17f416fdfca978ebcd5124f8da5546affb3a079b65a6e8daf42b41f",
+      "output_sha256": "ab432885a00a64e021455fa0f6cdd5d6813584b6000284f2817cc659c3edd329"
+    },
+    "math500": {
+      "source_url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/eval_datasets/math500.jsonl",
+      "source_rows": 500,
+      "prompts": 500,
+      "source_sha256": "4f530d9d3126dca41c12a96e78ec0dd460b7202052ba86101c4da159cea33aac",
+      "output_sha256": "25dffbb2fe74eb25ad8ea3f8388d4c4a89076501896c67c2f5897e6b03643083"
+    },
+    "aime25": {
+      "source_url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/eval_datasets/aime25.jsonl",
+      "source_rows": 30,
+      "prompts": 30,
+      "source_sha256": "b8835996839caa1d982c5bb9ecaeca636424f0b8ed9f33a40b084feb1c1766d0",
+      "output_sha256": "5b5f957aa6b1a704bad0a417121da06b60407aeb3ba789828080ef21416a426f"
+    },
+    "humaneval": {
+      "source_url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/eval_datasets/humaneval.jsonl",
+      "source_rows": 164,
+      "prompts": 164,
+      "source_sha256": "7aaed6a3987007ecee4851ee4572fde214aa2a36ae83fa21be9c5f443aa71675",
+      "output_sha256": "6b2b8c0d4e3826dc6d9e5cc00827611057a80ef89e22202ccf3eed8052c6cab4"
+    },
+    "mbpp": {
+      "source_url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/eval_datasets/mbpp.jsonl",
+      "source_rows": 257,
+      "prompts": 256,
+      "source_sha256": "019b981f7122e39ce58866cf93f4206511c72532cb537bbaf298753a0f128ba7",
+      "output_sha256": "e4c453c2d43e90c29d3c1b67d748a859d4bdf709a495bedf26022f2644c58522"
+    },
+    "livecodebench": {
+      "source_url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/eval_datasets/livecodebench.jsonl",
+      "source_rows": 1055,
+      "prompts": 500,
+      "source_sha256": "40ed536492f331ac27b3b68506072366ca1d3a304b92c31d822574e778c87318",
+      "output_sha256": "838497ef90d146c1fa777fbfef32c5836552f24589535c88ca49d2c775dff0a9"
+    },
+    "mtbench": {
+      "source_url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/eval_datasets/mt-bench.jsonl",
+      "source_rows": 80,
+      "prompts": 80,
+      "source_sha256": "df05defbcea350dff39f7d2996a7cba8a029e6e06069dfcdab11ceb998d743b0",
+      "output_sha256": "025e2e63441f99698995468455b050c39919fd1310fe95afa40be35209de16d7"
+    },
+    "alpaca": {
+      "source_url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/eval_datasets/alpaca.jsonl",
+      "source_rows": 52002,
+      "prompts": 500,
+      "source_sha256": "c1f1623ac08e4c4f024604bb2689a024963eb7eb9dbbc29e57dda5a11d87e07b",
+      "output_sha256": "a119d414c9f33a09cef323b5087cfc48895c18ed18691d17cc070e73f508a0e7"
+    },
+    "arena-hard-v2": {
+      "source_url": "https://raw.githubusercontent.com/deepseek-ai/DeepSpec/005e03b81cec38b7da6399833d609ee89a2587f2/eval_datasets/arena-hard-v2.jsonl",
+      "source_rows": 750,
+      "prompts": 500,
+      "source_sha256": "e5fcce94ffb1a2ef2082b5c63ac36608f2b7faf00da13ecb94ce2adc649b7b91",
+      "output_sha256": "ef56a9965d3b1826be93f8c9fdf34c59ae89911ef23df85f9f11a6112ba7f25c"
+    }
+  }
+}

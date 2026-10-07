@@ -9,7 +9,7 @@ Set `debug.enable_perf_metrics: true` (or override on the CLI). When disabled, n
 added to the training loop.
 
 ```bash
-python3 -m angelspec.train_entry --config configs/default.yaml debug.enable_perf_metrics=true
+python3 -m angelspec.train_entry --config <your-distributed-config>.yaml debug.enable_perf_metrics=true
 ```
 
 ## Metrics

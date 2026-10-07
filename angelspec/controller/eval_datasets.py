@@ -17,6 +17,19 @@ import random
 from pathlib import Path
 
 DATASETS = ("gsm8k", "humaneval", "mbpp", "math500", "mtbench", "livecodebench")
+# DeepSpec evaluation suite in DeepSpec eval.py TASKS order; used by
+# examples/eval/evaluate_dp.py.
+DEEPSPEC_DATASETS = (
+    "gsm8k",
+    "math500",
+    "aime25",
+    "humaneval",
+    "mbpp",
+    "livecodebench",
+    "mtbench",
+    "alpaca",
+    "arena-hard-v2",
+)
 
 # HF identifiers — used ONLY by the offline dump tool, never at train time.
 DATASET_SPECS = {

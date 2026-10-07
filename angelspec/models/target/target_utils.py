@@ -69,7 +69,18 @@ class TargetLMHead(nn.Module):
             except Exception:
                 pass
 
-        instance._load_lm_head(local_model_path, lm_head_key)
+        try:
+            instance._load_lm_head(local_model_path, lm_head_key)
+        except KeyError:
+            # Checkpoints with tied word embeddings may omit ``lm_head.weight``;
+            # load the shared embedding instead. The fallback
+            # applies only to the default key, so a wrong custom key still raises.
+            if not (
+                lm_head_key == "lm_head.weight"
+                and bool(getattr(instance.config, "tie_word_embeddings", False))
+            ):
+                raise
+            instance._load_lm_head(local_model_path, "model.embed_tokens.weight")
 
         if load_norm:
             instance._init_and_load_norm(local_model_path, norm_key)

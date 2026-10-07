@@ -29,6 +29,7 @@ Architecture overview:
 
 import json
 import os
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -37,6 +38,31 @@ import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import PretrainedConfig, PreTrainedModel
+
+_FLASH_FLEX_KERNEL_OPTIONS = {"BACKEND": "FLASH"}
+_SM120_FLEX_KERNEL_OPTIONS = {
+    "BACKEND": "TRITON",
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "num_warps": 4,
+    "num_stages": 2,
+}
+
+
+def _dflash_flex_kernel_options(
+    device: torch.device,
+) -> dict[str, object]:
+    """Select a DFlash FlexAttention backend supported by the execution phase.
+
+    FA4 does not fully support block-sparse training on SM120, so every DFlash
+    sparse-attention phase uses constrained Triton there. Other architectures
+    use the FLASH backend.
+    """
+    if device.type == "cuda":
+        major, _minor = torch.cuda.get_device_capability(device)
+        if major == 12:
+            return dict(_SM120_FLEX_KERNEL_OPTIONS)
+    return dict(_FLASH_FLEX_KERNEL_OPTIONS)
 
 
 class DFlashConfig(PretrainedConfig):
@@ -170,6 +196,22 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 
 
+@dataclass(frozen=True)
+class DFlashAttentionContextCache:
+    """Anchor-independent context K/V after K-norm and context RoPE."""
+
+    key: torch.Tensor
+    value: torch.Tensor
+
+
+@dataclass(frozen=True)
+class DFlashContextCache:
+    """Per-layer context K/V reused by independent DFlash query blocks."""
+
+    layer_caches: tuple[DFlashAttentionContextCache, ...]
+    hidden_dtype: torch.dtype
+
+
 class DFlashAttention(nn.Module):
     """Dual-source KV attention for DFlash.
 
@@ -204,13 +246,59 @@ class DFlashAttention(nn.Module):
             base=getattr(config, "rope_theta", 10000.0),
         )
 
+    def prepare_context_cache(
+        self,
+        context_hidden: torch.Tensor,
+        context_position_ids: torch.Tensor,
+        rope_sequence_length: Optional[int] = None,
+    ) -> DFlashAttentionContextCache:
+        """Project the context side once for reuse by independent draft blocks."""
+        if context_hidden.ndim != 3:
+            raise ValueError("context_hidden must have shape [batch, sequence, hidden]")
+        if context_position_ids.shape != context_hidden.shape[:2]:
+            raise ValueError("context_position_ids must match the context batch and sequence")
+        if context_position_ids.device != context_hidden.device:
+            raise ValueError("context positions and hidden states must be on the same device")
+        if context_position_ids.dtype == torch.bool or context_position_ids.is_floating_point():
+            raise TypeError("context_position_ids must use an integer dtype")
+        if (
+            rope_sequence_length is None
+            and context_position_ids.numel()
+            and bool((context_position_ids < 0).any())
+        ):
+            raise ValueError("context_position_ids must be non-negative")
+
+        bsz, ctx_len, _ = context_hidden.shape
+        key = self.k_proj(context_hidden)
+        key = key.view(bsz, ctx_len, self.num_kv_heads, self.head_dim)
+        key = self.k_norm(key).transpose(1, 2)
+        value = self.v_proj(context_hidden)
+        value = value.view(bsz, ctx_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # A context-cache append can contain only a suffix while retaining the
+        # suffix's absolute positions.  Size the RoPE view for the largest
+        # position rather than assuming every cache segment starts at zero.
+        rope_len = ctx_len if rope_sequence_length is None else int(rope_sequence_length)
+        if rope_len < ctx_len:
+            raise ValueError("rope_sequence_length cannot be shorter than the context segment")
+        if rope_sequence_length is None and context_position_ids.numel():
+            rope_len = max(rope_len, int(context_position_ids.max().item()) + 1)
+        cos, sin = self.rotary_emb(key, seq_len=rope_len)
+        cos = cos.to(key.device)
+        sin = sin.to(key.device)
+        cos_key = cos.squeeze(1).squeeze(0)[context_position_ids].unsqueeze(1)
+        sin_key = sin.squeeze(1).squeeze(0)[context_position_ids].unsqueeze(1)
+        key = (key * cos_key) + (_rotate_half(key) * sin_key)
+        return DFlashAttentionContextCache(key=key, value=value)
+
     def forward(
         self,
         draft_hidden: torch.Tensor,
-        context_hidden: torch.Tensor,
+        context_hidden: Optional[torch.Tensor],
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        context_cache: Optional[DFlashAttentionContextCache] = None,
     ) -> torch.Tensor:
         """Forward pass with dual-source KV.
 
@@ -222,44 +310,89 @@ class DFlashAttention(nn.Module):
             block_mask: FlexAttention BlockMask for block-causal attention
         """
         bsz, draft_len, _ = draft_hidden.shape
-        ctx_len = context_hidden.shape[1]
+        if context_cache is None:
+            if context_hidden is None:
+                raise ValueError("context_hidden is required when context_cache is not provided")
+            ctx_len = context_hidden.shape[1]
+        else:
+            if context_hidden is not None:
+                raise ValueError("provide either context_hidden or context_cache, not both")
+            key_ctx, value_ctx = context_cache.key, context_cache.value
+            if key_ctx.device != draft_hidden.device or value_ctx.device != draft_hidden.device:
+                raise ValueError("cached context K/V and draft hidden states must share a device")
+            if key_ctx.shape != value_ctx.shape:
+                raise ValueError("cached context K/V must have equal shapes")
+            if key_ctx.ndim != 4 or key_ctx.shape[0] != bsz:
+                raise ValueError("cached context K/V must have shape [batch, heads, sequence, dim]")
+            if key_ctx.shape[1] != self.num_kv_heads or key_ctx.shape[3] != self.head_dim:
+                raise ValueError("cached context K/V has incompatible attention dimensions")
+            ctx_len = key_ctx.shape[2]
 
         # Q only from draft
         q = self.q_proj(draft_hidden)
         q = q.view(bsz, draft_len, self.num_heads, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)  # [B, num_heads, draft_len, head_dim]
 
-        # K/V from both context and draft (shared projections)
-        k_ctx = self.k_proj(context_hidden)
-        v_ctx = self.v_proj(context_hidden)
-        k_draft = self.k_proj(draft_hidden)
-        v_draft = self.v_proj(draft_hidden)
+        if context_cache is None:
+            # Without a cache, concatenate context and draft K before the
+            # tokenwise K-norm and RoPE.
+            key_ctx = self.k_proj(context_hidden)
+            value_ctx = self.v_proj(context_hidden)
+            key_draft = self.k_proj(draft_hidden)
+            value_draft = self.v_proj(draft_hidden)
+            key = torch.cat([key_ctx, key_draft], dim=1)
+            value = torch.cat([value_ctx, value_draft], dim=1)
 
-        # Concatenate K and V along sequence dimension BEFORE normalization
-        # Concat → K-norm → RoPE
-        k = torch.cat([k_ctx, k_draft], dim=1)  # [B, ctx+draft, kv_dim]
-        v = torch.cat([v_ctx, v_draft], dim=1)
+            total_len = ctx_len + draft_len
+            key = key.view(bsz, total_len, self.num_kv_heads, self.head_dim)
+            key = self.k_norm(key).transpose(1, 2)
+            value = value.view(bsz, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        total_len = ctx_len + draft_len
-        k = k.view(bsz, total_len, self.num_kv_heads, self.head_dim)
-        k = self.k_norm(k).transpose(1, 2)  # [B, num_kv_heads, ctx+draft, head_dim]
-        v = v.view(bsz, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            full_position_ids = torch.cat(
+                [context_position_ids, draft_position_ids],
+                dim=1,
+            )
+            cos, sin = self.rotary_emb(q, seq_len=total_len)
+            cos = cos.to(q.device)
+            sin = sin.to(q.device)
+            cos_query = cos.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
+            sin_query = sin.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
+            q = (q * cos_query) + (_rotate_half(q) * sin_query)
+            cos_key = cos.squeeze(1).squeeze(0)[full_position_ids].unsqueeze(1)
+            sin_key = sin.squeeze(1).squeeze(0)[full_position_ids].unsqueeze(1)
+            key = (key * cos_key) + (_rotate_half(key) * sin_key)
+        else:
+            key_draft = self.k_proj(draft_hidden)
+            value_draft = self.v_proj(draft_hidden)
+            key_draft = key_draft.view(
+                bsz,
+                draft_len,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+            key_draft = self.k_norm(key_draft).transpose(1, 2)
+            value_draft = value_draft.view(
+                bsz,
+                draft_len,
+                self.num_kv_heads,
+                self.head_dim,
+            ).transpose(1, 2)
 
-        # RoPE with concatenated position IDs (context + draft)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-        cos, sin = self.rotary_emb(q, seq_len=total_len)
-        cos = cos.to(q.device)
-        sin = sin.to(q.device)
+            total_len = ctx_len + draft_len
+            cos, sin = self.rotary_emb(q, seq_len=total_len)
+            cos = cos.to(q.device)
+            sin = sin.to(q.device)
+            cos_query = cos.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
+            sin_query = sin.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
+            q = (q * cos_query) + (_rotate_half(q) * sin_query)
 
-        # Apply RoPE to Q (using draft positions only — last draft_len of full_position_ids)
-        cos_q = cos.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
-        sin_q = sin.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
-        q = (q * cos_q) + (_rotate_half(q) * sin_q)
-
-        # Apply RoPE to K (using full concatenated positions)
-        cos_k = cos.squeeze(1).squeeze(0)[full_position_ids].unsqueeze(1)
-        sin_k = sin.squeeze(1).squeeze(0)[full_position_ids].unsqueeze(1)
-        k = (k * cos_k) + (_rotate_half(k) * sin_k)
+            # K-norm and RoPE are tokenwise, so the cached context K (normalized
+            # and rotated in advance) equals the uncached result.
+            cos_draft = cos.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
+            sin_draft = sin.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
+            key_draft = (key_draft * cos_draft) + (_rotate_half(key_draft) * sin_draft)
+            key = torch.cat([key_ctx, key_draft], dim=2)
+            value = torch.cat([value_ctx, value_draft], dim=2)
 
         if block_mask is not None:
             from angelspec.models.ops.flex_attention import (
@@ -270,16 +403,25 @@ class DFlashAttention(nn.Module):
             # instead of materializing expanded KV via _repeat_kv
             attn_output = compile_friendly_flex_attention(
                 query=q,
-                key=k,
-                value=v,
+                key=key,
+                value=value,
                 block_mask=block_mask,
                 enable_gqa=True,
+                kernel_options=_dflash_flex_kernel_options(
+                    q.device,
+                ),
             )
         else:
             # Fallback: bidirectional attention (no mask) — expand KV for SDPA
-            k = _repeat_kv(k, self.num_kv_groups)
-            v = _repeat_kv(v, self.num_kv_groups)
-            attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=False, dropout_p=0.0)
+            key = _repeat_kv(key, self.num_kv_groups)
+            value = _repeat_kv(value, self.num_kv_groups)
+            attn_output = F.scaled_dot_product_attention(
+                q,
+                key,
+                value,
+                is_causal=False,
+                dropout_p=0.0,
+            )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, draft_len, self.num_heads * self.head_dim)
@@ -312,10 +454,11 @@ class DFlashDecoderLayer(nn.Module):
     def forward(
         self,
         draft_hidden: torch.Tensor,
-        context_hidden: torch.Tensor,
+        context_hidden: Optional[torch.Tensor],
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        context_cache: Optional[DFlashAttentionContextCache] = None,
     ) -> torch.Tensor:
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
@@ -326,6 +469,7 @@ class DFlashDecoderLayer(nn.Module):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
+            context_cache=context_cache,
         )
         draft_hidden = residual + draft_hidden
 
@@ -374,6 +518,7 @@ class DFlashDraftModel(PreTrainedModel):
     """
 
     config_class = DFlashConfig
+    supports_context_cache = True
 
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)
@@ -416,6 +561,60 @@ class DFlashDraftModel(PreTrainedModel):
         concatenated = torch.cat(all_hidden_states, dim=-1).to(self.context_proj.weight.dtype)
         projected = self.context_proj(concatenated)
         return self.context_norm(projected)
+
+    def prepare_context_cache(
+        self,
+        context_feature: torch.Tensor,
+        context_position_ids: torch.Tensor,
+        rope_sequence_length: Optional[int] = None,
+    ) -> DFlashContextCache:
+        """Build anchor-independent context K/V once for repeated EDR queries."""
+        if context_feature.ndim != 3:
+            raise ValueError("DFlash context_feature must have shape [B, S, D]")
+        if context_position_ids.shape != context_feature.shape[:2]:
+            raise ValueError("context_position_ids must match the DFlash context shape")
+
+        return DFlashContextCache(
+            layer_caches=tuple(
+                layer.self_attn.prepare_context_cache(
+                    context_feature,
+                    context_position_ids,
+                    rope_sequence_length=rope_sequence_length,
+                )
+                for layer in self.layers
+            ),
+            hidden_dtype=context_feature.dtype,
+        )
+
+    def forward_with_context_cache(
+        self,
+        *,
+        draft_input_ids: Optional[torch.Tensor],
+        context_cache: DFlashContextCache,
+        draft_position_ids: torch.Tensor,
+        context_position_ids: torch.Tensor,
+        block_mask=None,
+        noise_embedding: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run anchor-dependent draft work against prepared context K/V."""
+        if len(context_cache.layer_caches) != len(self.layers):
+            raise ValueError("DFlash context cache does not match the number of draft layers")
+        if noise_embedding is not None:
+            draft_hidden = noise_embedding.to(context_cache.hidden_dtype)
+        else:
+            draft_hidden = self.embed_tokens(draft_input_ids).to(context_cache.hidden_dtype)
+
+        for layer, layer_cache in zip(self.layers, context_cache.layer_caches):
+            draft_hidden = layer(
+                draft_hidden=draft_hidden,
+                context_hidden=None,
+                draft_position_ids=draft_position_ids,
+                context_position_ids=context_position_ids,
+                block_mask=block_mask,
+                context_cache=layer_cache,
+            )
+
+        return self.final_norm(draft_hidden)
 
     def forward(
         self,

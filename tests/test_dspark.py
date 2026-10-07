@@ -126,7 +126,15 @@ class TestDSparkForward(unittest.TestCase):
         self.assertEqual(len(out), 6)
         loss, acc, lpp, app, cpp, comps = out
         self.assertEqual(
-            set(comps), {"ce_loss", "kl_loss", "lk_loss", "l1_loss", "confidence_loss"}
+            set(comps),
+            {
+                "ce_loss",
+                "kl_loss",
+                "lk_loss",
+                "l1_loss",
+                "e2e_tv_loss",
+                "confidence_loss",
+            },
         )
         for v in comps.values():
             self.assertTrue(torch.isfinite(v).all())
@@ -154,20 +162,15 @@ class TestDSparkForward(unittest.TestCase):
         for v in comps.values():
             self.assertAlmostEqual(v.item(), 0.0, places=5)
 
-    def test_next_token_convention_slot0_masked(self):
-        # DSpark now reuses the unified DFlashModel.forward: slot 0 is the masked
-        # anchor (count 0) and slots 1..B-1 are the supervised predictions. With a
-        # long fully supervised sequence every predicted slot accumulates tokens.
+    def test_learned_first_populates_every_slot(self):
+        # The implementation anchor is input-only; all B query slots are learned
+        # output distributions at positions anchor+1 through anchor+B.
         m = _make_dspark_model(block_size=4, num_anchors=8)
         b = _batch(B=2, S=40)
         b["loss_mask"] = torch.ones(2, 40)
         _, _, _, _, count_per_position, _ = m(**b)
         self.assertEqual(count_per_position.shape[0], 4)
-        self.assertEqual(count_per_position[0].item(), 0.0)  # anchor slot masked
-        self.assertTrue(
-            (count_per_position[1:] > 0).all(),
-            f"some predicted slot unsupervised: {count_per_position.tolist()}",
-        )
+        self.assertTrue((count_per_position > 0).all(), count_per_position.tolist())
 
     def test_grad_flow_and_frozen_embedding(self):
         m = _make_dspark_model()

@@ -28,6 +28,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from angelspec.config.distillation import resolve_distillation_sampling
 from angelspec.models.dflash import DFlashModel
 from angelspec.models.draft.dflash import DFlashDraftModel
 from angelspec.training import checkpoint
@@ -36,6 +37,7 @@ from angelspec.training.optimizer import BF16Optimizer
 from angelspec.training.trainer import Trainer
 from angelspec.utils.distributed import get_gloo_group
 from angelspec.utils.logging import logger
+from angelspec.utils.metrics import edr_metric_totals, edr_metrics_from_totals
 
 
 class DFlashTrainer(Trainer):
@@ -55,13 +57,28 @@ class DFlashTrainer(Trainer):
         "lk_loss",
         "l1_loss",
         "e2e_tv_loss",
+        "edr_surrogate_loss",
+        "edr_weighted_cost_sum",
+        "edr_num_horizons",
+        "edr_num_degenerate_horizons",
+        "edr_generated_tokens",
     ]
+    _edr_loss_component_keys = {
+        "edr_surrogate_loss",
+        "edr_weighted_cost_sum",
+        "edr_num_horizons",
+        "edr_num_degenerate_horizons",
+        "edr_generated_tokens",
+    }
 
     def __init__(self, args: Namespace):
         super().__init__(args)
         self.target_lm_head: Optional[torch.nn.Module] = None
         self.num_target_layers = getattr(args, "dflash_num_target_layers", 5)
         self.block_size = getattr(args, "dflash_block_size", 16)
+        self.query_includes_input_anchor = bool(
+            getattr(args, "dflash_query_includes_input_anchor", False)
+        )
         self.num_anchors = getattr(args, "dflash_num_anchors", 512)
         self.loss_decay_gamma = getattr(args, "dflash_loss_decay_gamma", 7.0)
         self.fp32_lm_head = getattr(args, "dflash_fp32_lm_head", True)
@@ -69,6 +86,24 @@ class DFlashTrainer(Trainer):
         # CE-side distillation (L1 / top-K KL / LK). Defaults reproduce the
         # legacy decay CE baseline (ce_loss_alpha=1.0, all distill weights 0).
         self.loss_objective = getattr(args, "dflash_loss_objective", "decay")
+        self.edr_chunk_size = int(getattr(args, "dflash_edr_chunk_size", 64))
+        self.edr_vocab_chunk_size = int(
+            getattr(args, "dflash_edr_vocab_chunk_size", 16384)
+        )
+        self.edr_full_anchor_backprop = bool(
+            getattr(args, "dflash_edr_full_anchor_backprop", False)
+        )
+        self.edr_cross_row_batch_size = int(
+            getattr(args, "dflash_edr_cross_row_batch_size", 1)
+        )
+        self.distill_cross_row_batch_size = int(
+            getattr(args, "dflash_distill_cross_row_batch_size", 1)
+        )
+        self.edr_dp_workers = int(getattr(args, "dflash_edr_dp_workers", 1))
+        self.edr_stop_token_ids = tuple(
+            int(token_id)
+            for token_id in (getattr(args, "dflash_edr_stop_token_ids", None) or ())
+        )
         self.dpace_alpha = getattr(args, "dflash_dpace_alpha", 0.5)
         self.ce_loss_alpha = getattr(args, "dflash_ce_loss_alpha", 1.0)
         self.l1_loss_alpha = getattr(args, "dflash_l1_loss_alpha", 0.0)
@@ -84,7 +119,10 @@ class DFlashTrainer(Trainer):
         # last_hidden_states (target final norm) is required for KL/LK/e2e_tv
         # teacher logits; L1 uses raw last_hidden_states directly (no norm).
         self._distill_enabled = (
-            self._lk_enabled or self._kl_enabled or self.e2e_tv_loss_weight > 0.0
+            self._lk_enabled
+            or self._kl_enabled
+            or self.e2e_tv_loss_weight > 0.0
+            or self.loss_objective == "edr"
         )
         # Rolling window of the top-5 candidate-layer set for the gated_sum layer
         # selection run; drives the topk_jaccard / backbone_size early-stop signals.
@@ -132,6 +170,19 @@ class DFlashTrainer(Trainer):
             lk_loss_type=self.lk_loss_type,
             lk_eta=self.lk_eta,
             e2e_tv_loss_weight=self.e2e_tv_loss_weight,
+            **resolve_distillation_sampling(self.args),
+            edr_chunk_size=self.edr_chunk_size,
+            edr_vocab_chunk_size=self.edr_vocab_chunk_size,
+            edr_dp_workers=self.edr_dp_workers,
+            edr_full_anchor_backprop=self.edr_full_anchor_backprop,
+            query_includes_input_anchor=self.query_includes_input_anchor,
+            edr_stop_token_ids=self.edr_stop_token_ids,
+            edr_temperature=getattr(self.args, "dflash_edr_temperature", 1.0),
+            edr_top_k=getattr(self.args, "dflash_edr_top_k", -1),
+            edr_top_p=getattr(self.args, "dflash_edr_top_p", 1.0),
+            distill_mean_by_row=self.distill_cross_row_batch_size > 1,
+            edr_reuse_context_cache=getattr(self.args, "dflash_edr_reuse_context_cache", False),
+            edr_rejection_cache_max_mb=getattr(self.args, "dflash_edr_rejection_cache_max_mb", 0),
         )
 
     def init_model(
@@ -190,6 +241,17 @@ class DFlashTrainer(Trainer):
                 embedding_key=getattr(self.args, "embedding_key", "model.embed_tokens.weight"),
             )
 
+        hf_export_loaded = False
+        if dist.get_rank() == 0:
+            hf_export_loaded = checkpoint.load_hf_export(
+                draft_model,
+                getattr(self.args, "load_path", None),
+                cache_dir=getattr(self.args, "model_download_dir", None),
+            )
+        hf_export_flag = torch.tensor([int(hf_export_loaded)], dtype=torch.uint8)
+        dist.broadcast(hf_export_flag, src=0, group=get_gloo_group())
+        hf_export_loaded = bool(hf_export_flag.item())
+
         draft_model.freeze_embedding()
         draft_model = draft_model.to(torch.bfloat16)
 
@@ -241,6 +303,7 @@ class DFlashTrainer(Trainer):
             weight_decay=getattr(self.args, "weight_decay", 0.0),
             max_grad_norm=self.args.max_grad_norm,
             warmup_ratio=warmup_ratio,
+            warmup_steps=getattr(self.args, "epoch_cache_warmup_steps", None),
             total_steps=total_steps,
             decay_style=decay_style if decay_style != "WSD" else "cosine",
             min_lr=getattr(self.args, "min_lr", 0.0),
@@ -263,7 +326,9 @@ class DFlashTrainer(Trainer):
                 self.optimizer.optimizer,
                 max_lr=self.args.learning_rate,
                 total_steps=total_steps,
-                warmup_steps=int(warmup_ratio * total_steps),
+                warmup_steps=getattr(
+                    self.args, "epoch_cache_warmup_steps", int(warmup_ratio * total_steps)
+                ),
                 decay_style="WSD",
                 min_lr=getattr(self.args, "min_lr", 0.0),
                 wsd_decay_steps=int(wsd_ratio * total_steps),
@@ -272,7 +337,7 @@ class DFlashTrainer(Trainer):
 
         self.lr_scheduler = self.optimizer.lr_scheduler
 
-        checkpoint_payload = checkpoint.load(self)
+        checkpoint_payload = None if hf_export_loaded else checkpoint.load(self)
         checkpoint.finalize_load(self, checkpoint_payload)
 
         self._init_target_lm_head(target_model_path)
@@ -364,6 +429,12 @@ class DFlashTrainer(Trainer):
             loss_mask = loss_mask.squeeze(-1)
         loss_mask = loss_mask.to(device, non_blocking=True)
 
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is not None:
+            if attention_mask.dim() == 3:
+                attention_mask = attention_mask.squeeze(-1)
+            attention_mask = attention_mask.to(device, non_blocking=True)
+
         # Sequence packing (DFlashPackingCollator): doc ids + doc-local positions.
         # Absent under the legacy pad-to-longest collator, in which case forward
         # falls back to the single-document path.
@@ -388,7 +459,11 @@ class DFlashTrainer(Trainer):
         hidden_states_list = self._split_hidden_states(hidden_states)
         del hidden_states
 
-        opd_on = bool(self.score_engine) and getattr(self.args, "dflash_opd_enabled", False)
+        opd_on = (
+            self.loss_objective != "edr"
+            and bool(self.score_engine)
+            and getattr(self.args, "dflash_opd_enabled", False)
+        )
         out = self.model(
             input_ids=input_ids,
             hidden_states_list=hidden_states_list,
@@ -396,6 +471,7 @@ class DFlashTrainer(Trainer):
             lm_head_weight=self.target_lm_head_weight,
             last_hidden_states=last_hidden_states,
             target_norm=target_norm,
+            attention_mask=attention_mask,
             ctx_doc_ids=ctx_doc_ids,
             base_position_ids=base_position_ids,
             return_draft=opd_on,
@@ -464,7 +540,9 @@ class DFlashTrainer(Trainer):
         anchors = opd["anchor_positions"].cpu()
         keep = opd["block_keep_mask"].cpu()
         ids_cpu = input_ids.detach().cpu()
-        bs = int(getattr(self.args, "dflash_block_size", 16))
+        # With dflash_query_includes_input_anchor the draft runs one extra query
+        # that is not a proposal; take the tree width from the proposals tensor.
+        bs = int(proposals.shape[-1])
         device = draft_hidden.device
         lm_head = self.target_lm_head_weight
         b = ids_cpu.shape[0]
@@ -607,6 +685,8 @@ class DFlashTrainer(Trainer):
         """Reduce extra scalar loss components into ``{prefix}{key}`` global means."""
         out: dict = {}
         for key in self._extra_loss_component_keys:
+            if key in self._edr_loss_component_keys:
+                continue
             vals = [m[key] for m in all_step_metrics if key in m]
             if not vals:
                 continue
@@ -615,7 +695,21 @@ class DFlashTrainer(Trainer):
                 dist.all_reduce(value, op=dist.ReduceOp.SUM)
                 value = value / dist.get_world_size()
             out[f"{prefix}{key}"] = value.item()
+        out.update(self._reduce_edr_components(all_step_metrics, prefix))
         return out
+
+    def _reduce_edr_components(self, all_step_metrics: list[dict], prefix: str) -> dict:
+        """Form exact horizon-weighted EDR metrics from global sums and counts."""
+        edr_metrics = [m for m in all_step_metrics if "edr_num_horizons" in m]
+        if not edr_metrics:
+            return {}
+
+        totals = edr_metric_totals(edr_metrics)
+
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+
+        return edr_metrics_from_totals(totals, prefix)
 
     def _reduce_opd_metrics(self, all_step_metrics: list[dict]) -> dict:
         """DP-reduce the two-stream OPD sum/count scalars into logged means.
@@ -656,7 +750,7 @@ class DFlashTrainer(Trainer):
         safe_total_count = pred_count_pp.sum().clamp(min=1.0)
         avg_acc = ((pred_acc_pp * pred_count_pp).sum() / safe_total_count).item()
 
-        gamma = self.loss_decay_gamma
+        gamma = None if self.loss_objective == "edr" else self.loss_decay_gamma
         if gamma is not None and gamma > 0:
             k = torch.arange(pred_loss_pp.shape[0], device=pred_loss_pp.device)
             weights = torch.exp(-k.float() / gamma)
@@ -705,10 +799,11 @@ class DFlashTrainer(Trainer):
             count_key="count_pp",
         )
 
-        # Drop anchor slot (index 0) — see _aggregate_metrics for rationale.
-        pred_loss_pp = avg_loss_pp[1:]
-        pred_acc_pp = avg_acc_pp[1:]
-        pred_count_pp = count_pp[1:]
+        # All B entries are learned proposals; index 0 predicts the first token
+        # after the anchor.
+        pred_loss_pp = avg_loss_pp
+        pred_acc_pp = avg_acc_pp
+        pred_count_pp = count_pp
 
         cumulative = 1.0
         simulated_acc_len = 0.0
@@ -799,14 +894,13 @@ class DFlashTrainer(Trainer):
             count_key="count_per_position",
         )
 
-        # Skip index 0 (anchor slot, always zero); indices 1..B-1 are the
-        # predicted tokens at 1..B-1 steps past the anchor. Re-index to 0..B-2
-        # so the naming matches Eagle3 (acc_0 = first predicted token).
-        pred_loss_pp = avg_loss_pp[1:]
-        pred_acc_pp = avg_acc_pp[1:]
-        pred_count_pp = count_pp[1:]
+        # All B entries are learned outputs. Metric names are zero-based: acc_0
+        # is the first token predicted after the input anchor.
+        pred_loss_pp = avg_loss_pp
+        pred_acc_pp = avg_acc_pp
+        pred_count_pp = count_pp
 
-        # Simulated accepted length: acc_0 + acc_0*acc_1 + ... + prod(acc_0..acc_{B-2})
+        # Simulated accepted length: acc_0 + acc_0*acc_1 + ... + prod(acc_0..acc_{B-1})
         # Models the expected number of consecutively accepted draft tokens.
         cumulative = 1.0
         simulated_acc_len = 0.0
@@ -818,13 +912,14 @@ class DFlashTrainer(Trainer):
 
         metrics = {
             "train/avg_loss": avg_loss,
-            "train/avg_acc": avg_acc,
-            "train/simulated_acc_len": simulated_acc_len,
             "train/grad_norm": grad_norm.item() if grad_norm is not None else 0.0,
             "train/global_step": self.global_step,
             "train/lr": self.optimizer.get_learning_rate(),
             "train/step": step,
         }
+        if self.loss_objective != "edr":
+            metrics["train/avg_acc"] = avg_acc
+            metrics["train/simulated_acc_len"] = simulated_acc_len
 
         for i in range(pred_loss_pp.shape[0]):
             metrics[f"train/ploss_{i}"] = pred_loss_pp[i].item()

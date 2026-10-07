@@ -2,23 +2,25 @@
 
 ## Launching a run
 
-Training is launched through the `angelspec.train_entry` module, driven by a YAML config. The
-example scripts wrap this call:
+Training is launched through a module driven by a YAML config:
+`angelspec.train_entry` for distributed (Ray/Mooncake) runs, or
+`angelspec.train_single_gpu` for the single-GPU EDR paper recipes. The example scripts
+wrap this call:
 
 ```bash
-./examples/qwen3-8b-dfly/run.sh
+./examples/qwen3-8b-dfly-cpt-edr/run.sh
 ```
 
-Under the hood each script runs something like:
+Under the hood the paper recipes run something like:
 
 ```bash
-python3 -m angelspec.train_entry --config configs/vllm_qwen3_8b_dfly.yaml
+python3 -m angelspec.train_single_gpu --config configs/vllm_qwen3_8b_dfly_edr.yaml
 ```
 
 Any config value can be overridden on the command line using dotted keys:
 
 ```bash
-python3 -m angelspec.train_entry --config configs/sglang_qwen3_8b.yaml \
+python3 -m angelspec.train_single_gpu --config configs/vllm_qwen3_8b_dfly_edr.yaml \
     training.learning_rate=5e-5 training.num_train_steps=500
 ```
 

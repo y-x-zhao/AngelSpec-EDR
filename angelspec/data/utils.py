@@ -96,7 +96,7 @@ class DataCollatorWithPadding:
             # Round up to nearest bucket to reduce unique shapes for torch.compile.
             # Without this, every batch gets a different padded length, causing
             # FlexAttention recompilation (~1s overhead per new shape).
-            _BUCKET = 256
+            _BUCKET = 128
             max_length = ((max_length + _BUCKET - 1) // _BUCKET) * _BUCKET
             attention_masks = [torch.ones_like(item["input_ids"]).long() for item in features]
 

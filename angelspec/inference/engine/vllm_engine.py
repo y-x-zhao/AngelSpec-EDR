@@ -60,6 +60,14 @@ _PROTECTION_ENGINE_KEYS = frozenset(
 )
 
 
+def _feature_extraction_model_length(args) -> int | None:
+    """Return vLLM's max_model_len: max_seq_length, plus one for full-length cached inputs."""
+    max_length = getattr(args, "max_seq_length", None)
+    if max_length and getattr(args, "allow_full_length_cached_sequences", False):
+        return max_length + 1
+    return max_length
+
+
 class VllmEngine(InferenceEngine, RayActor):
     """Ray actor wrapper for vLLM LLM engine with distributed deployment support.
 
@@ -366,9 +374,9 @@ class VllmEngine(InferenceEngine, RayActor):
             timeout_min = getattr(self.args, "distributed_timeout_minutes", 10)
             engine_kwargs["distributed_timeout_seconds"] = timeout_min * 60
 
-        max_seq_length = getattr(self.args, "max_seq_length", None)
-        if max_seq_length and not getattr(self.args, "vllm_score_engine", False):
-            engine_kwargs["max_model_len"] = max_seq_length
+        max_model_length = _feature_extraction_model_length(self.args)
+        if max_model_length and not getattr(self.args, "vllm_score_engine", False):
+            engine_kwargs["max_model_len"] = max_model_length
 
         # Multi-node rendezvous is only for the legacy mp per-node-LLM path.
         # Under the ray backend a single EngineCore owns all workers and vLLM's
@@ -470,6 +478,8 @@ class VllmEngine(InferenceEngine, RayActor):
             raise ValueError("Exactly one of input_ids_ref or formatted_prompts must be set")
 
         use_prompts = formatted_prompts is not None
+        if use_prompts and getattr(self.args, "allow_full_length_cached_sequences", False):
+            raise ValueError("Full-length cached sequences require token IDs, not formatted prompts")
         input_ids_list: list[torch.Tensor] | None = None
 
         if use_prompts:
@@ -494,23 +504,22 @@ class VllmEngine(InferenceEngine, RayActor):
 
         # Skip samples whose prompt leaves no room for the >=1 token vLLM must
         # generate to extract hidden states: vLLM rejects the whole request when
-        # prompt_len + 1 > max_model_len (== max_seq_length), and the offending
-        # request can stall the run. SglEngine guards the same way. The dataset
-        # reserves 1 token (max_seq_length - 1), so only pathological samples
-        # (e.g. media-expanded prompts) reach here.
-        max_seq_length = getattr(self.args, "max_seq_length", None)
+        # prompt_len + 1 > max_model_len. By default this slot lies within
+        # max_seq_length; with allow_full_length_cached_sequences it lies outside
+        # that limit. The generated token is never part of the training input.
+        max_model_length = _feature_extraction_model_length(self.args)
         active_indices = list(range(batch_size))
-        if max_seq_length:
+        if max_model_length:
             prompt_lengths = self._prompt_token_lengths(
                 use_prompts, formatted_prompts, input_ids_list
             )
             active_indices = []
             for i, prompt_len in enumerate(prompt_lengths):
-                if prompt_len is not None and prompt_len + 1 > max_seq_length:
+                if prompt_len is not None and prompt_len + 1 > max_model_length:
                     logger.warning(
                         f"VllmEngine rank {self.rank}: skipping data_id={data_ids[i]} "
                         f"because prompt_tokens={prompt_len} leaves no room for the "
-                        f"generated token within max_seq_length={max_seq_length}"
+                        f"generated token within max_model_len={max_model_length}"
                     )
                     continue
                 active_indices.append(i)

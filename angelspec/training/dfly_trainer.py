@@ -7,6 +7,7 @@ DFly draft model (DFlash FC context + DFlare fusion residual) and wraps it in
 hyperparameter namespace.
 """
 
+from angelspec.config.distillation import resolve_distillation_sampling
 from angelspec.training.dflash_trainer import DFlashTrainer
 
 
@@ -38,4 +39,17 @@ class DFlyTrainer(DFlashTrainer):
             lk_loss_type=self.lk_loss_type,
             lk_eta=self.lk_eta,
             e2e_tv_loss_weight=self.e2e_tv_loss_weight,
+            **resolve_distillation_sampling(self.args),
+            edr_chunk_size=self.edr_chunk_size,
+            edr_vocab_chunk_size=self.edr_vocab_chunk_size,
+            edr_dp_workers=self.edr_dp_workers,
+            edr_full_anchor_backprop=self.edr_full_anchor_backprop,
+            query_includes_input_anchor=self.query_includes_input_anchor,
+            edr_stop_token_ids=self.edr_stop_token_ids,
+            edr_temperature=getattr(self.args, "dflash_edr_temperature", 1.0),
+            edr_top_k=getattr(self.args, "dflash_edr_top_k", -1),
+            edr_top_p=getattr(self.args, "dflash_edr_top_p", 1.0),
+            distill_mean_by_row=self.distill_cross_row_batch_size > 1,
+            edr_reuse_context_cache=getattr(self.args, "dflash_edr_reuse_context_cache", False),
+            edr_rejection_cache_max_mb=getattr(self.args, "dflash_edr_rejection_cache_max_mb", 0),
         )

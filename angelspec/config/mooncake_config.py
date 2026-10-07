@@ -22,8 +22,6 @@ import os
 from dataclasses import dataclass
 from typing import Tuple
 
-from angelspec.transfer.mooncake.helpers import calculate_eagle3_buffer_size
-
 
 @dataclass
 class MooncakeConfig:
@@ -78,6 +76,8 @@ class MooncakeConfig:
     kv_lease_ttl_s: float = 5.0  # Mooncake master lease TTL only; not used for deletion timing
 
     def __post_init__(self):
+        from angelspec.transfer.mooncake.helpers import calculate_eagle3_buffer_size
+
         # Coerce size fields: accept str ("4GB") or int
         for field_name in (
             "global_segment_size",

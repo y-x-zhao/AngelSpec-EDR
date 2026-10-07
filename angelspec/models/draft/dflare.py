@@ -197,6 +197,9 @@ class DFlareDraftModel(DFlashDraftModel):
     """
 
     config_class = DFlashConfig
+    # DFlare layers fuse context separately per layer and do not accept a
+    # DFlashAttentionContextCache.
+    supports_context_cache = False
 
     def __init__(self, config):
         # DFlashDraftModel.__init__ builds context_proj / context_norm / layers

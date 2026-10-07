@@ -20,12 +20,12 @@
 
 """Pipeline setup: mooncake config, training steps calculation, async training setup."""
 
-import math
-
 import ray
 
+from angelspec.training.schedule import (
+    auto_calculate_training_steps as auto_calculate_training_steps,
+)
 from angelspec.utils.env import get_angelspec_env_vars
-from angelspec.utils.logging import logger
 
 
 def build_mooncake_config(args):
@@ -90,53 +90,3 @@ def setup_async_training_with_engines(
         train_group.set_score_engine(score_engine)
 
     return controller, inference_manager
-
-
-def auto_calculate_training_steps(args, dataset_size: int):
-    """Auto-calculate num_train_steps and lr_total_steps based on dataset size if not explicitly set.
-
-    All step counts are in optimizer steps (not dispatches).
-    steps_per_epoch = dataset_size // global_batch_size
-    where global_batch_size = per_dp_rank_batch_size * dp_size * draft_accumulation_steps.
-
-    If num_train_steps is set by user, num_epochs is calculated from it.
-    Otherwise: lr_total_steps = steps_per_epoch * num_epochs
-    """
-
-    global_batch_size = args.global_batch_size
-    steps_per_epoch = dataset_size // global_batch_size
-
-    if steps_per_epoch == 0:
-        logger.warning(
-            f"Dataset size ({dataset_size}) < global_batch_size ({global_batch_size}). Setting steps_per_epoch to 1."
-        )
-        steps_per_epoch = 1
-
-    args.steps_per_epoch = steps_per_epoch
-
-    current_num_train_steps = getattr(args, "num_train_steps", None)
-    current_lr_total_steps = getattr(args, "lr_total_steps", None)
-
-    if current_num_train_steps is not None:
-        args.num_epochs = math.ceil(current_num_train_steps / steps_per_epoch)
-        logger.info(
-            f"Setting num_epochs to {args.num_epochs} based on num_train_steps={current_num_train_steps}!"
-        )
-        if current_lr_total_steps is None:
-            args.lr_total_steps = current_num_train_steps
-    else:
-        num_epochs = getattr(args, "num_epochs", 1)
-        calculated_total_steps = num_epochs * steps_per_epoch
-        args.num_train_steps = calculated_total_steps
-        if current_lr_total_steps is None:
-            args.lr_total_steps = calculated_total_steps
-
-    accumulation_steps = getattr(args, "draft_accumulation_steps", 1)
-    logger.info(
-        f"Training steps (optimizer steps): num_train_steps={args.num_train_steps}, "
-        f"lr_total_steps={args.lr_total_steps} "
-        f"(dataset_size={dataset_size}, global_batch_size={global_batch_size}, "
-        f"per_dp_rank_batch_size={args.per_dp_rank_batch_size}, "
-        f"accumulation_steps={accumulation_steps}, "
-        f"steps_per_epoch={steps_per_epoch}, num_epochs={args.num_epochs})"
-    )

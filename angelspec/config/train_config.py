@@ -32,8 +32,34 @@ from angelspec.utils.logging import logger
 
 
 @dataclass
+class TargetSamplingConfig:
+    """Sampling policy that generated the cached target responses.
+
+    Cache selection matches it against each cache's provenance sidecar, and
+    distribution-aware E2E/LK losses use it as the target distribution. When
+    null, these losses use T=1 without filtering and the single cache in
+    cache_dir is loaded. tools/regenerate_perfectblend.py supports only
+    enable_thinking=false and min_p=0.
+    """
+
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = -1
+    min_p: float = 0.0
+    enable_thinking: bool = False
+
+
+@dataclass
 class DatasetConfig:
     chat_template: str = "llama3"
+    # Optional cache roots, one per epoch, each containing tokenized_dataset/*.pt
+    # and its .pt.json sidecar. Each sidecar must be complete and declare
+    # cached_samples, which the step schedule uses.
+    epoch_cache_dirs: Optional[list[str]] = None
+    # Allow cached sequences of exactly max_seq_length tokens (the default limit
+    # is max_seq_length - 1). vLLM then gets one extra context slot for its
+    # feature-extraction output token.
+    allow_full_length_cached_sequences: bool = False
     defer_tokenization: bool = False
     drop_overlength: bool = (
         False  # drop (not truncate) samples whose token count exceeds max_seq_length-1
@@ -44,12 +70,13 @@ class DatasetConfig:
     eval_prompt_key: Optional[str] = None
     last_turn_loss_only: Any = "auto"  # bool or "auto"
     min_loss_tokens: int = (
-        0  # DFlash: skip sequences with < N supervised tokens (use 2*block_size)
+        0  # DFlash: skip sequences with < N supervised tokens (must be >= 2*proposal width)
     )
     prompt_key: str = "conversations"
     shuffle_dataset: bool = True
     train_data_path: str = ""
     num_proc: int = 64
+    target_sampling: Optional[TargetSamplingConfig] = None
 
 
 @dataclass
@@ -130,6 +157,13 @@ class TrainingConfig:
     lr_wsd_decay_ratio: float = 0.2
     lr_wsd_decay_style: str = "cosine"
     lr_total_steps: Optional[int] = None
+    # When true, resume model/optimizer/progress but replace the saved LR policy
+    # with the configured one at the restored step. Optimizer moments are kept.
+    override_lr_scheduler: bool = False
+    # Single-GPU training only: sort each optimizer step's rows by length before
+    # forming cross-row draft groups and target prefills (less padding). The
+    # optimizer batch and loss weighting are unchanged.
+    length_balance_optimizer_step: bool = False
     max_concurrent_batches: int = 1
     max_grad_norm: float = 0.5
     max_seq_length: int = 8192
@@ -196,7 +230,13 @@ class TrainingConfig:
     wsd_decay_style: Optional[str] = None
 
     # DFlash-specific parameters (ignored for Eagle3 training)
+    # Number of learned draft proposals per block (the input-anchor query slot
+    # enabled by dflash_query_includes_input_anchor is not counted).
     dflash_block_size: int = 16
+    # When true, query slot 0 holds the already-committed input anchor: the draft
+    # runs dflash_block_size + 1 query slots, and slots 1..dflash_block_size are
+    # the learned proposals for every objective (EDR, e2e, LK, CE).
+    dflash_query_includes_input_anchor: bool = False
     dflash_loss_decay_gamma: float = 7.0
     dflash_num_anchors: int = 512
     dflash_num_target_layers: int = 5
@@ -208,8 +248,9 @@ class TrainingConfig:
     # Unified DFlash loss architecture. Objective sets the per-position CE
     # weighting; the CE-side distillation terms (L1 / top-K KL / LK) stack on top
     # and are independent of (and combine additively with) the OPD term below.
-    #   dflash_loss_objective: "decay" (exp-decay, default) or "dpace" (D-PACE
-    #     continuation-value weighting; ignores dflash_loss_decay_gamma for CE).
+    #   dflash_loss_objective: "decay" (exp-decay, default), "dpace" (D-PACE
+    #     continuation-value weighting), or "edr" (Expected Decoding Rounds objective;
+    #     requires training.load_path and target last hidden states).
     #   dflash_dpace_alpha: D-PACE confidence smoothing in [0, 1].
     #   dflash_ce_loss_alpha: scalar multiplier on the CE term. DEFAULT 1.0 —
     #     this is applied UNCONDITIONALLY, so a non-1.0 default (e.g. DSpark's
@@ -221,6 +262,67 @@ class TrainingConfig:
     #     last-layer logits, in [0, 1] against CE. LK precedes KL when both set;
     #     both need target last_hidden_states (+ final norm). 0 disables.
     dflash_loss_objective: str = "decay"
+    # EDR only: distribution that generated the cached target trajectories.
+    # Target: temperature, then top-k/top-p and renormalization. Draft: same
+    # temperature, full vocabulary (no top-k/top-p). Distribution-aware E2E/LK
+    # instead reads dataset.target_sampling; these EDR knobs do not affect it.
+    dflash_edr_temperature: float = 1.0
+    dflash_edr_top_k: int = -1
+    dflash_edr_top_p: float = 1.0
+    # None selects the objective default: on for E2E alone, off for LK and when
+    # both terms are active. A bool overrides the default; EDR ignores it.
+    # When enabled, TV, LK KL/mixture and D-PACE confidence use
+    # dataset.target_sampling for the target and an unfiltered draft at the same
+    # temperature. When disabled, both use the full vocabulary at T=1.
+    dflash_distill_distribution_aware: Optional[bool] = None
+    # Maximum round starts evaluated per call in EDR's no-grad statistics sweep.
+    # The gradient pass samples at most dflash_num_anchors starts unless
+    # dflash_edr_full_anchor_backprop is set.
+    dflash_edr_chunk_size: int = 64
+    # Vocabulary entries reduced at once by EDR's streamed rejection/acceptance
+    # computation and the streamed TV/LK objectives. Bounds FP32 temporaries.
+    dflash_edr_vocab_chunk_size: int = 16384
+    # Token IDs that independently terminate target decoding. When unset, EDR
+    # resolves generation_config.eos_token_id from the target checkpoint and
+    # unions it with decode.stop_token_ids. Multi-token stop strings are not
+    # representable here because their stopping semantics depend on a prefix.
+    dflash_edr_stop_token_ids: Optional[list[int]] = None
+    # When true, backpropagate every EDR round start with exact Bellman occupancy
+    # weights. When false, sample dflash_num_anchors starts (capped PPS) with a
+    # Horvitz--Thompson correction. Chunk size bounds each gradient forward in
+    # both modes; full-anchor work grows with sequence length.
+    dflash_edr_full_anchor_backprop: bool = False
+    # Share one differentiable, anchor-independent draft context K/V projection
+    # between EDR's no-grad statistics sweep and gradient pass. Saves a second
+    # projection, but keeps its autograd activations live through the sweep.
+    dflash_edr_reuse_context_cache: bool = False
+    # MiB budget per EDR model call for boolean rejection masks kept from the
+    # selected-anchor forward to backward, so backward skips rebuilding target
+    # probabilities. Zero disables the cache. The budget is shared across all
+    # gradient chunks and rows.
+    dflash_edr_rejection_cache_max_mb: int = 0
+    # Number of consecutive accumulation microbatches combined into one EDR
+    # forward. The model batches the rows and divides chunk_size's anchor-block
+    # budget across them. Values >1 are supported only by angelspec.train_single_gpu
+    # and require draft_accumulation_steps to be divisible by this value.
+    dflash_edr_cross_row_batch_size: int = 1
+    # Number of consecutive accumulation rows combined into one model call for
+    # e2e-TV or LK distillation. The loss is a mean over rows, so the optimizer
+    # batch and sample weighting are the same as with 1. Values >1 are supported
+    # only by angelspec.train_single_gpu and require draft_accumulation_steps to
+    # be divisible by this value.
+    dflash_distill_cross_row_batch_size: int = 1
+    # Single-GPU training only: maximum rows per HF target prefill. Consecutive
+    # cross-row groups with the same 128-token padding width share one prefill;
+    # draft groups and loss scaling are the same. Zero runs one target prefill
+    # per cross-row group.
+    single_gpu_target_batch_size: int = 0
+    # Single-GPU training only: cap on padded tokens when combining target
+    # prefills (0 = no cap). A single cross-row group is always allowed.
+    single_gpu_target_max_tokens: int = 0
+    # Maximum native CPU workers used by the batched Bellman recurrence. Actual
+    # use is capped by the number of horizons in the cross-row group.
+    dflash_edr_dp_workers: int = 1
     dflash_dpace_alpha: float = 0.5
     dflash_ce_loss_alpha: float = 1.0
     dflash_l1_loss_alpha: float = 0.0
@@ -445,6 +547,16 @@ def _resolve_relative_paths(
         ):
             OmegaConf.update(config, dotted_key, os.path.abspath(os.path.join(base_dir, expanded)))
 
+    # Like cache_dir, epoch cache locations are CWD-relative rather than relative
+    # to the configs/ file. Resolve after cache_dir so ${cache_dir}/epochN works.
+    if "cache_dir" not in skip_keys:
+        directories = OmegaConf.select(config, "dataset.epoch_cache_dirs", default=None)
+        if directories is not None:
+            OmegaConf.update(config, "dataset.epoch_cache_dirs", [
+                os.path.abspath(os.path.join(base_dir, os.path.expanduser(path)))
+                for path in directories
+            ])
+
 
 def _validate_vllm_config(config: DictConfig) -> None:
     """Raise if the vllm backend is selected with unsupported feature flags."""
@@ -457,6 +569,29 @@ def _validate_vllm_config(config: DictConfig) -> None:
     for key, label in unsupported_flags.items():
         if OmegaConf.select(config, key):
             raise NotImplementedError(f"{label} is not yet supported with the vllm backend!")
+
+
+def _validate_full_length_cached_sequences(config: DictConfig) -> None:
+    if not config.dataset.allow_full_length_cached_sequences:
+        return
+    if config.dataset.defer_tokenization or config.training.train_with_decode:
+        raise ValueError(
+            "dataset.allow_full_length_cached_sequences requires pretokenized "
+            "feature-extraction training, without defer_tokenization or train_with_decode"
+        )
+    if config.model.target_model_backend not in {"hf", "vllm"}:
+        raise ValueError(
+            "dataset.allow_full_length_cached_sequences supports only the "
+            "single-GPU HF target or vLLM feature extraction"
+        )
+    if (
+        config.model.target_model_backend == "vllm"
+        and config.inference.inference_engine_type != "vllm"
+    ):
+        raise ValueError(
+            "dataset.allow_full_length_cached_sequences requires "
+            "inference.inference_engine_type=vllm with the vLLM target backend"
+        )
 
 
 def _save_config_snapshot(config: DictConfig) -> None:
@@ -502,6 +637,7 @@ def load_config(
     config = OmegaConf.merge(*configs_to_merge)
     _resolve_relative_paths(config, os.getcwd())
 
+    _validate_full_length_cached_sequences(config)
     _validate_vllm_config(config)
 
     if save_snapshot:
